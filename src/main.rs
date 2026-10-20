@@ -398,9 +398,18 @@ impl Store {
         char_name: &str,
         started: bool,
     ) -> Result<(), String> {
+        // DELETE + INSERT rather than `INSERT OR REPLACE` (turso 0.1.0 does not
+        // support the upsert clause). The primary key is (user, channel).
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO possession (user_uuid7, channel_id, char_name, started) \
+                "DELETE FROM possession WHERE user_uuid7 = ?1 AND channel_id = ?2",
+                turso::params![vtext(user), vtext(channel)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "INSERT INTO possession (user_uuid7, channel_id, char_name, started) \
                  VALUES (?1, ?2, ?3, ?4)",
                 turso::params![
                     vtext(user),
@@ -565,22 +574,21 @@ fn base_send(id: &EngineIdentity, chat: &ChatMessage, msg: String) -> SendToPlat
     }
 }
 
-/// A plain chat reply (command feedback).
-async fn send_chat(write: &Arc<AsyncMutex<WsWriteHalf>>, id: &EngineIdentity, msg: String, chat: &ChatMessage) {
-    let c = ContainerForEngine {
+/// A plain chat reply (command feedback) as an engine container.
+fn reply_container(id: &EngineIdentity, chat: &ChatMessage, msg: String) -> ContainerForEngine {
+    ContainerForEngine {
         version: 2,
         auth_token: id.auth.clone(),
         module_name: id.module.clone(),
         module_instance_uuid7: id.instance.clone(),
         payload: Some(EnginePayload::SendToPlatforms(base_send(id, chat, msg))),
-    };
-    send_container(write, c).await;
+    }
 }
 
-/// A PROXIED send: post `msg` as the character, then delete the trigger.
+/// A PROXIED send (post `msg` as the character, then delete the trigger) as an
+/// engine container.
 #[allow(clippy::too_many_arguments)]
-async fn send_proxy(
-    write: &Arc<AsyncMutex<WsWriteHalf>>,
+fn proxy_container(
     id: &EngineIdentity,
     chat: &ChatMessage,
     msg: String,
@@ -588,7 +596,7 @@ async fn send_proxy(
     display_name: String,
     avatar: Option<Vec<u8>>,
     delete_message_id: String,
-) {
+) -> ContainerForEngine {
     let mut send = base_send(id, chat, msg);
     send.proxy = Some(ProxyIdentity {
         character_key: char_key,
@@ -596,14 +604,13 @@ async fn send_proxy(
         avatar: avatar.unwrap_or_default(),
     });
     send.delete_message_id = delete_message_id;
-    let c = ContainerForEngine {
+    ContainerForEngine {
         version: 2,
         auth_token: id.auth.clone(),
         module_name: id.module.clone(),
         module_instance_uuid7: id.instance.clone(),
         payload: Some(EnginePayload::SendToPlatforms(send)),
-    };
-    send_container(write, c).await;
+    }
 }
 
 /// Download an attached image (Discord CDN URL) as bytes.
@@ -622,31 +629,35 @@ async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Str
 
 // ── command handling ────────────────────────────────────────────────────────
 
-/// Handle one `!rp` command. Feedback goes back to the channel as a plain,
-/// non-proxied reply.
+/// Handle one `!rp` command, returning the engine messages to send (the
+/// feedback replies). Async only for the store + attachment fetch, so the whole
+/// command flow is drivable in a test.
 async fn handle_command(
-    write: &Arc<AsyncMutex<WsWriteHalf>>,
     id: &EngineIdentity,
     chat: &ChatMessage,
     stores: &mut Stores,
     sent_avatars: &mut HashSet<String>,
     guild: &str,
     cmd: RpCmd,
-) {
+) -> Vec<ContainerForEngine> {
+    let mut out: Vec<ContainerForEngine> = Vec::new();
     let user = chat.user_uuid7.clone();
     let channel = chat.channel_id.clone();
-    let reply = |m: String| {
-        let (write, id, chat) = (write.clone(), id.clone(), chat.clone());
-        async move { send_chat(&write, &id, m, &chat).await }
-    };
+
+    // A macro (not a closure) so it does not borrow `out` for its lifetime —
+    // the function returns `out` at the end.
+    macro_rules! push {
+        ($m:expr) => {
+            out.push(reply_container(id, chat, $m))
+        };
+    }
 
     match cmd {
         RpCmd::Help => {
-            reply(format!(
+            push!(format!(
                 "RP: `{f}rp possess <char>` · `{f}rp start`/`stop` · `{f}rp create <char>` (attach an image for the avatar) · `{f}rp <char> set global=true` · `{f}rp list` · `{f}rp <char> delete`",
                 f = DEFAULT_FLAG
-            ))
-            .await;
+            ));
         }
         RpCmd::List => {
             let mut names = Vec::new();
@@ -665,27 +676,24 @@ async fn handle_command(
             } else {
                 format!("Your characters: {}", names.join(", "))
             };
-            reply(msg).await;
+            push!(msg);
         }
         RpCmd::Create(name) => {
             if stores.character_exists_any(guild, &user, &name).await {
-                reply(format!("You already have a character named `{name}`.")).await;
-                return;
+                push!(format!("You already have a character named `{name}`."));
+                return out;
             }
             let (_, _, attach) = discord_meta(&chat.raw_data);
             let avatar = fetch_attachment(&attach).await;
             match stores.guild(guild).await {
                 Ok(s) => match s.create_character(&user, &name, avatar.as_deref()).await {
-                    Ok(()) => {
-                        reply(match avatar {
-                            Some(_) => format!("Created `{name}` with an avatar."),
-                            None => format!("Created `{name}`. Add an avatar with `!rp {name} avatar` + an image."),
-                        })
-                        .await;
-                    }
-                    Err(e) => reply(format!("Could not create `{name}`: {e}")).await,
+                    Ok(()) => push!(match avatar {
+                        Some(_) => format!("Created `{name}` with an avatar."),
+                        None => format!("Created `{name}`. Add an avatar with `!rp {name} avatar` + an image."),
+                    }),
+                    Err(e) => push!(format!("Could not create `{name}`: {e}")),
                 },
-                Err(e) => reply(format!("Storage error: {e}")).await,
+                Err(e) => push!(format!("Storage error: {e}")),
             }
         }
         RpCmd::Delete(name) => {
@@ -702,18 +710,17 @@ async fn handle_command(
                     done = true;
                 }
             }
-            reply(if done {
+            push!(if done {
                 format!("Deleted `{name}`.")
             } else {
                 format!("No character named `{name}`.")
-            })
-            .await;
+            });
         }
         RpCmd::SetAvatar { name } => {
             let (_, _, attach) = discord_meta(&chat.raw_data);
             let Some(avatar) = fetch_attachment(&attach).await else {
-                reply(format!("Attach an image to set `{name}`'s avatar.")).await;
-                return;
+                push!(format!("Attach an image to set `{name}`'s avatar."));
+                return out;
             };
             let mut ok = false;
             if let Ok(s) = stores.guild(guild).await {
@@ -734,9 +741,9 @@ async fn handle_command(
             }
             if ok {
                 sent_avatars.clear(); // force a re-send so the webhook avatar updates
-                reply(format!("Updated `{name}`'s avatar.")).await;
+                push!(format!("Updated `{name}`'s avatar."));
             } else {
-                reply(format!("No character named `{name}`.")).await;
+                push!(format!("No character named `{name}`."));
             }
         }
         RpCmd::SetChar { name, key, value } => {
@@ -755,12 +762,11 @@ async fn handle_command(
                                 }
                             }
                         }
-                        reply(if moved {
+                        push!(if moved {
                             format!("`{name}` is now global.")
                         } else {
                             format!("No character named `{name}` here.")
-                        })
-                        .await;
+                        });
                     }
                     Some(false) => {
                         let mut moved = false;
@@ -774,23 +780,22 @@ async fn handle_command(
                                 }
                             }
                         }
-                        reply(if moved {
+                        push!(if moved {
                             format!("`{name}` is no longer global.")
                         } else {
                             format!("No global character named `{name}`.")
-                        })
-                        .await;
+                        });
                     }
-                    None => reply("`global` must be true or false.".to_string()).await,
+                    None => push!("`global` must be true or false.".to_string()),
                 }
             } else {
-                reply(format!("Unknown setting `{key}`. Try `global=true`.")).await;
+                push!(format!("Unknown setting `{key}`. Try `global=true`."));
             }
         }
         RpCmd::Possess(name) => {
             if !stores.character_exists_any(guild, &user, &name).await {
-                reply(format!("No character named `{name}` — create it first.")).await;
-                return;
+                push!(format!("No character named `{name}` — create it first."));
+                return out;
             }
             // Keep the current started state; just swap the character.
             let started = possession_of(stores, guild, &user, &channel)
@@ -800,30 +805,29 @@ async fn handle_command(
             if let Ok(s) = stores.guild(guild).await {
                 let _ = s.set_possession(&user, &channel, &name, started).await;
             }
-            reply(if started {
+            push!(if started {
                 format!("Now speaking as `{name}`.")
             } else {
                 format!("Possessing `{name}`. `!rp start` to begin.")
-            })
-            .await;
+            });
         }
         RpCmd::Start => {
             let possessed = possession_of(stores, guild, &user, &channel)
                 .await
                 .map(|(c, _)| c);
             let Some(name) = possessed else {
-                reply("Pick a character first: `!rp possess <char>`.".to_string()).await;
-                return;
+                push!("Pick a character first: `!rp possess <char>`.".to_string());
+                return out;
             };
             if !stores.character_exists_any(guild, &user, &name).await {
-                reply(format!("`{name}` no longer exists — pick another.")).await;
-                return;
+                push!(format!("`{name}` no longer exists — pick another."));
+                return out;
             }
             if let Ok(s) = stores.guild(guild).await {
                 let _ = s.set_possession(&user, &channel, &name, true).await;
             }
             sent_avatars.clear();
-            reply(format!("Started — your messages now post as `{name}`. `!rp stop` to end.")).await;
+            push!(format!("Started — your messages now post as `{name}`. `!rp stop` to end."));
         }
         RpCmd::Stop => {
             if let Some((name, _)) = possession_of(stores, guild, &user, &channel).await {
@@ -831,9 +835,10 @@ async fn handle_command(
                     let _ = s.set_possession(&user, &channel, &name, false).await;
                 }
             }
-            reply("Stopped proxying. Your messages post normally again.".to_string()).await;
+            push!("Stopped proxying. Your messages post normally again.".to_string());
         }
     }
+    out
 }
 
 /// Look up (char_name, started) for a user+channel.
@@ -926,11 +931,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             send_container(&write_for_task, receipt).await;
                         }
                         if let Some(chat) = &process.raw_message {
-                            handle_message(
-                                &write_for_task, &id, chat, &mut stores, &mut sent_avatars,
+                            for c in handle_message(
+                                &id, chat, &mut stores, &mut sent_avatars,
                                 &settings.command_flag,
                             )
-                            .await;
+                            .await
+                            {
+                                send_container(&write_for_task, c).await;
+                            }
                         }
                         // Echo the stage so the pipeline advances.
                         let ack = ContainerForEngine {
@@ -990,15 +998,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Handle one message: a `!rp` command, or a proxied post for a started user.
 async fn handle_message(
-    write: &Arc<AsyncMutex<WsWriteHalf>>,
     id: &EngineIdentity,
     chat: &ChatMessage,
     stores: &mut Stores,
     sent_avatars: &mut HashSet<String>,
     command_flag: &str,
-) {
+) -> Vec<ContainerForEngine> {
     if chat.platform != "discord" || chat.user_uuid7.is_empty() {
-        return;
+        return Vec::new();
     }
     let (msg_id, guild, _attach) = discord_meta(&chat.raw_data);
     let guild_key = if guild.is_empty() { DM_DB.to_string() } else { guild };
@@ -1008,21 +1015,21 @@ async fn handle_message(
     // A `!rp` command (parsed here — the module is a catch-all, not a command owner).
     if let Some(args) = parse_rp_args(&chat.raw_message, command_flag, RP_COMMAND) {
         if let Some(cmd) = parse_rp_command(&args) {
-            handle_command(write, id, chat, stores, sent_avatars, &guild_key, cmd).await;
+            return handle_command(id, chat, stores, sent_avatars, &guild_key, cmd).await;
         }
-        return;
+        return Vec::new();
     }
 
     // Otherwise: proxy the message if the user is started here.
     let Some((char_name, started)) = possession_of(stores, &guild_key, &user, &channel).await else {
-        return;
+        return Vec::new();
     };
     if !started {
-        return;
+        return Vec::new();
     }
     let text = chat.raw_message.clone();
     if text.trim().is_empty() || is_spoiler_bypass(&text) {
-        return; // nothing to post, or an intentional bypass
+        return Vec::new(); // nothing to post, or an intentional bypass
     }
     let key = character_key(&user, &char_name);
     let cache_key = format!("{channel}\u{1f}{key}");
@@ -1035,17 +1042,7 @@ async fn handle_message(
         }
         a
     };
-    send_proxy(
-        write,
-        id,
-        chat,
-        text,
-        key,
-        char_name,
-        avatar,
-        msg_id,
-    )
-    .await;
+    vec![proxy_container(id, chat, text, key, char_name, avatar, msg_id)]
 }
 
 #[cfg(test)]
@@ -1125,5 +1122,139 @@ mod tests {
         let home = std::env::var("HOME").unwrap_or_default();
         assert_eq!(expand_tilde("~/.cockatiel/rp"), format!("{home}/.cockatiel/rp"));
         assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+    }
+
+    // ── end-to-end: pretend to be a Discord chat ────────────────────────────
+
+    /// A `ChatMessage` exactly as the discord-adapter emits it for a
+    /// MESSAGE_CREATE (raw_data = the Discord JSON, which carries the id/guild).
+    fn discord_msg(user: &str, channel: &str, guild: &str, msg_id: &str, text: &str) -> ChatMessage {
+        let raw = format!(
+            r#"{{"id":"{msg_id}","guild_id":"{guild}","channel_id":"{channel}","content":{}}}"#,
+            serde_json::to_string(text).unwrap()
+        );
+        ChatMessage {
+            platform: "discord".into(),
+            raw_data: raw.into_bytes(),
+            raw_message: text.into(),
+            user_uuid7: user.into(),
+            command: None,
+            user_data: Some(UserData {
+                username: user.into(),
+                ..Default::default()
+            }),
+            channel_id: channel.into(),
+        }
+    }
+
+    fn test_identity() -> EngineIdentity {
+        EngineIdentity {
+            auth: "t".into(),
+            instance: "inst".into(),
+            module: "rp".into(),
+        }
+    }
+
+    /// The SendToPlatforms the module emitted (its outward effects).
+    fn sends(v: &[ContainerForEngine]) -> Vec<SendToPlatforms> {
+        v.iter()
+            .filter_map(|c| match &c.payload {
+                Some(EnginePayload::SendToPlatforms(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Drive the WHOLE RP flow as a fake Discord chat would: create → possess →
+    /// start → proxy → bypass → list → stop → global → delete, asserting each
+    /// step's effect (the store state + the emitted sends).
+    #[tokio::test]
+    async fn rp_flow_start_to_finish() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let mut sent: HashSet<String> = HashSet::new();
+        let id = test_identity();
+        let (user, channel, guild) = ("u1", "chan", "guild1");
+        let mut n = 0;
+        let mut say = |text: &str| {
+            n += 1;
+            discord_msg(user, channel, guild, &format!("m{n}"), text)
+        };
+        // 1. create
+        let out = handle_message(&id, &say("!rp create Alice"), &mut stores, &mut sent, "!").await;
+        assert_eq!(sends(&out).len(), 1);
+        assert!(sends(&out)[0].msg.contains("Created `Alice`"), "{}", sends(&out)[0].msg);
+        assert!(stores.character_exists_any(guild, user, "Alice").await);
+
+        // 2. possess
+        let out = handle_message(&id, &say("!rp possess Alice"), &mut stores, &mut sent, "!").await;
+        assert!(sends(&out)[0].msg.contains("Possessing `Alice`"));
+        assert_eq!(
+            possession_of(&mut stores, guild, user, channel).await,
+            Some(("Alice".to_string(), false))
+        );
+
+        // 3. a normal message while NOT started → nothing proxied
+        assert!(handle_message(&id, &say("hello"), &mut stores, &mut sent, "!").await.is_empty());
+
+        // 4. start
+        let out = handle_message(&id, &say("!rp start"), &mut stores, &mut sent, "!").await;
+        assert!(sends(&out)[0].msg.contains("Started"));
+        assert_eq!(
+            possession_of(&mut stores, guild, user, channel).await,
+            Some(("Alice".to_string(), true))
+        );
+
+        // 5. a normal message while started → a PROXY send that deletes the trigger
+        let out = handle_message(&id, &say("hello world"), &mut stores, &mut sent, "!").await;
+        let s = sends(&out);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].msg, "hello world");
+        let proxy = s[0].proxy.as_ref().expect("proxy identity");
+        assert_eq!(proxy.display_name, "Alice");
+        assert_eq!(proxy.character_key, "u1:Alice");
+        assert_eq!(s[0].delete_message_id, "m5"); // the trigger message's id
+        assert_eq!(s[0].platform, "discord");
+        assert_eq!(s[0].channel_id, "chan");
+        assert_eq!(s[0].actor_uuid7, "u1");
+
+        // 6. a whole-message spoiler → bypassed (nothing sent)
+        assert!(
+            handle_message(&id, &say("||out of character||"), &mut stores, &mut sent, "!")
+                .await
+                .is_empty(),
+            "a spoilered message posts normally, so we emit nothing"
+        );
+
+        // 7. list
+        let out = handle_message(&id, &say("!rp list"), &mut stores, &mut sent, "!").await;
+        assert!(sends(&out)[0].msg.contains("Alice"));
+
+        // 8. stop → messages post normally again
+        let out = handle_message(&id, &say("!rp stop"), &mut stores, &mut sent, "!").await;
+        assert!(sends(&out)[0].msg.contains("Stopped"));
+        assert!(handle_message(&id, &say("back to normal"), &mut stores, &mut sent, "!").await.is_empty());
+
+        // 9. set global=true → the character moves to the global DB, still usable
+        let out = handle_message(&id, &say("!rp Alice set global=true"), &mut stores, &mut sent, "!").await;
+        assert!(sends(&out)[0].msg.contains("now global"));
+        assert!(stores.character_exists_any(guild, user, "Alice").await);
+        handle_message(&id, &say("!rp possess Alice"), &mut stores, &mut sent, "!").await;
+        handle_message(&id, &say("!rp start"), &mut stores, &mut sent, "!").await;
+        let out = handle_message(&id, &say("hi again"), &mut stores, &mut sent, "!").await;
+        assert_eq!(sends(&out)[0].proxy.as_ref().unwrap().display_name, "Alice");
+
+        // 10. delete
+        handle_message(&id, &say("!rp stop"), &mut stores, &mut sent, "!").await;
+        let out = handle_message(&id, &say("!rp delete Alice"), &mut stores, &mut sent, "!").await;
+        assert!(sends(&out)[0].msg.contains("Deleted"));
+        assert!(!stores.character_exists_any(guild, user, "Alice").await);
+
+        // 11. commands are ignored for non-discord platforms
+        let mut non = discord_msg(user, channel, guild, "z", "!rp start");
+        non.platform = "twitch".into();
+        assert!(handle_message(&id, &non, &mut stores, &mut sent, "!").await.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
