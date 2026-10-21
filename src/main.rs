@@ -183,6 +183,7 @@ enum RpCmd {
     SetChar { name: String, key: String, value: String },
     SetAvatar { name: String },
     Sheet(String),
+    Detailed(bool),
 }
 
 /// Parse the args (already stripped of `!rp`) into a subcommand.
@@ -198,6 +199,7 @@ fn parse_rp_command(args: &str) -> Option<RpCmd> {
         "list" => Some(RpCmd::List),
         "start" => Some(RpCmd::Start),
         "stop" => Some(RpCmd::Stop),
+        "detailed" => parse_bool(rest).map(RpCmd::Detailed),
         "possess" => (!rest.is_empty()).then(|| RpCmd::Possess(rest.to_string())),
         "create" => (!rest.is_empty()).then(|| RpCmd::Create(rest.to_string())),
         "delete" => (!rest.is_empty()).then(|| RpCmd::Delete(rest.to_string())),
@@ -243,6 +245,29 @@ fn parse_bool(v: &str) -> Option<bool> {
         "false" | "0" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// The signed delta between two stat values, as a display string (e.g. `-2`,
+/// `+1`, `+0.5`), or `None` if either value is non-numeric.
+fn stat_delta(old: &str, new: &str) -> Option<String> {
+    if let (Ok(a), Ok(b)) = (old.trim().parse::<i64>(), new.trim().parse::<i64>()) {
+        return Some(format!("{:+}", b - a));
+    }
+    if let (Ok(a), Ok(b)) = (old.trim().parse::<f32>(), new.trim().parse::<f32>()) {
+        return Some(format!("{:+}", b - a));
+    }
+    None
+}
+
+/// Render the per-turn status line: `-# Turn 42 · HP 18 (-2) · Stamina 7 (+1)`.
+/// `changed` is (key, rendered-value) pairs, where the value already carries its
+/// signed delta (e.g. `18 (-2)`) when numeric.
+fn format_status(turn: i64, changed: &[(String, String)]) -> String {
+    let mut s = format!("-# Turn {turn}");
+    for (k, v) in changed {
+        s.push_str(&format!(" · {k} {v}"));
+    }
+    s
 }
 
 /// Pull the Discord bits the RP flow needs out of the adapter's raw message
@@ -357,6 +382,26 @@ impl Store {
                  user_uuid7 TEXT NOT NULL, channel_id TEXT NOT NULL, \
                  char_name TEXT NOT NULL, started INTEGER NOT NULL DEFAULT 0, \
                  PRIMARY KEY (user_uuid7, channel_id))",
+                (),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS channel_settings (\
+                 guild TEXT NOT NULL, channel_id TEXT NOT NULL, \
+                 detailed INTEGER NOT NULL DEFAULT 0, \
+                 PRIMARY KEY (guild, channel_id))",
+                (),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS status_snapshots (\
+                 guild TEXT NOT NULL, channel_id TEXT NOT NULL, \
+                 character TEXT NOT NULL, skey TEXT NOT NULL, svalue TEXT NOT NULL, \
+                 PRIMARY KEY (guild, channel_id, character, skey))",
                 (),
             )
             .await
@@ -491,13 +536,112 @@ impl Store {
         Ok(true)
     }
 
-    /// Bump a character's turn counter (once per proxied message).
-    async fn bump_turns(&self, user: &str, name: &str) {
+    /// Bump a character's turn counter (once per proxied message), returning the
+    /// new count (0 if the character is not in this store).
+    async fn bump_turns(&self, user: &str, name: &str) -> i64 {
         if let Ok(Some(mut info)) = self.character_info(user, name).await {
             info.turns += 1;
             let avatar = self.get_avatar(user, name).await.ok().flatten();
             let _ = self.save(user, name, &info, avatar.as_deref()).await;
+            return info.turns;
         }
+        0
+    }
+
+    /// Whether per-turn "detailed" status is on for this channel (false absent).
+    async fn detailed(&self, guild: &str, channel: &str) -> bool {
+        let Ok(mut rows) = self
+            .conn
+            .query(
+                "SELECT detailed FROM channel_settings WHERE guild = ?1 AND channel_id = ?2",
+                turso::params![vtext(guild), vtext(channel)],
+            )
+            .await
+        else {
+            return false;
+        };
+        let out = match rows.next().await {
+            Ok(Some(r)) => r.get::<i64>(0).unwrap_or(0) != 0,
+            _ => false,
+        };
+        while let Ok(Some(_)) = rows.next().await {}
+        out
+    }
+
+    /// Turn the per-channel detailed status on/off. DELETE + INSERT — turso
+    /// 0.1.0's `UPDATE` silently fails to persist.
+    async fn set_detailed(&self, guild: &str, channel: &str, on: bool) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM channel_settings WHERE guild = ?1 AND channel_id = ?2",
+                turso::params![vtext(guild), vtext(channel)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "INSERT INTO channel_settings (guild, channel_id, detailed) VALUES (?1, ?2, ?3)",
+                turso::params![vtext(guild), vtext(channel), vint(on as i64)],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// The last status shown for a character in a channel, as (key, value) pairs.
+    async fn status_snapshot(&self, guild: &str, channel: &str, character: &str) -> Vec<(String, String)> {
+        let Ok(mut rows) = self
+            .conn
+            .query(
+                "SELECT skey, svalue FROM status_snapshots \
+                 WHERE guild = ?1 AND channel_id = ?2 AND character = ?3 ORDER BY skey ASC",
+                turso::params![vtext(guild), vtext(channel), vtext(character)],
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Ok(Some(r)) = rows.next().await {
+            let k = r.get::<String>(0).unwrap_or_default();
+            let v = r.get::<String>(1).unwrap_or_default();
+            out.push((k, v));
+        }
+        out
+    }
+
+    /// Replace a character's status snapshot for a channel (DELETE + INSERT all).
+    async fn set_status_snapshot(
+        &self,
+        guild: &str,
+        channel: &str,
+        character: &str,
+        pairs: &[(String, String)],
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM status_snapshots WHERE guild = ?1 AND channel_id = ?2 AND character = ?3",
+                turso::params![vtext(guild), vtext(channel), vtext(character)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        for (k, v) in pairs {
+            self.conn
+                .execute(
+                    "INSERT INTO status_snapshots (guild, channel_id, character, skey, svalue) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    turso::params![
+                        vtext(guild),
+                        vtext(channel),
+                        vtext(character),
+                        vtext(k),
+                        vtext(v)
+                    ],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     async fn delete_character(&self, user: &str, name: &str) -> Result<(), String> {
@@ -911,7 +1055,7 @@ async fn handle_command(
     match cmd {
         RpCmd::Help => {
             push!(format!(
-                "RP: `{f}rp possess <char>` · `{f}rp start`/`stop` · `{f}rp create <char>` (attach an image for the avatar) · `{f}rp <char> set color=… pronouns=… bio=… tags=… group=… global=true` · `{f}rp <char> sheet` · `{f}rp list` · `{f}rp <char> delete`",
+                "RP: `{f}rp possess <char>` · `{f}rp start`/`stop` · `{f}rp create <char>` (attach an image for the avatar) · `{f}rp <char> set color=… pronouns=… bio=… tags=… group=… global=true` · `{f}rp <char> sheet` · `{f}rp list` · `{f}rp <char> delete` · `{f}rp detailed on`/`off`",
                 f = DEFAULT_FLAG
             ));
         }
@@ -1116,6 +1260,18 @@ async fn handle_command(
             }
             push!("Stopped proxying. Your messages post normally again.".to_string());
         }
+        RpCmd::Detailed(on) => {
+            match stores.guild(guild).await {
+                Ok(s) => match s.set_detailed(guild, &channel, on).await {
+                    Ok(()) => push!(format!(
+                        "Detailed status is now {} for this channel.",
+                        if on { "on" } else { "off" }
+                    )),
+                    Err(e) => push!(format!("Could not update detailed status: {e}")),
+                },
+                Err(e) => push!(format!("Storage error: {e}")),
+            }
+        }
     }
     out
 }
@@ -1297,6 +1453,19 @@ async fn handle_message(
         if let Some(cmd) = parse_rp_command(&args) {
             return handle_command(id, chat, stores, sent_avatars, &guild_key, state_db_dir, cmd).await;
         }
+        // `!rp detailed` with a missing/unparseable argument gets a usage line.
+        if args
+            .split_whitespace()
+            .next()
+            .map(|h| h.eq_ignore_ascii_case("detailed"))
+            .unwrap_or(false)
+        {
+            return vec![reply_container(
+                id,
+                chat,
+                format!("Usage: `{command_flag}rp detailed on|off`."),
+            )];
+        }
         return Vec::new();
     }
 
@@ -1322,11 +1491,47 @@ async fn handle_message(
         }
         a
     };
-    // Count this as one turn the character has been used.
-    if let Ok(s) = stores.guild(&guild_key).await {
-        s.bump_turns(&user, &char_name).await;
+    // Count this as one turn the character has been used (the new count).
+    let turn = match stores.guild(&guild_key).await {
+        Ok(s) => s.bump_turns(&user, &char_name).await,
+        Err(_) => 0,
+    };
+    let mut out = vec![proxy_container(id, chat, text, key, char_name.clone(), avatar, msg_id)];
+
+    // With detailed status on, append a PLAIN bot message showing what changed.
+    let is_detailed = match stores.guild(&guild_key).await {
+        Ok(s) => s.detailed(&guild_key, &channel).await,
+        Err(_) => false,
+    };
+    if is_detailed {
+        let flat: Vec<(String, String)> = read_state_stats(state_db_dir, &guild_key, &char_name)
+            .await
+            .into_iter()
+            .flat_map(|(_, items)| items)
+            .collect();
+        let snapshot = match stores.guild(&guild_key).await {
+            Ok(s) => s.status_snapshot(&guild_key, &channel, &char_name).await,
+            Err(_) => Vec::new(),
+        };
+        let mut changed: Vec<(String, String)> = Vec::new();
+        for (k, new_val) in &flat {
+            if let Some((_, old_val)) = snapshot.iter().find(|(sk, _)| sk == k) {
+                if old_val != new_val {
+                    match stat_delta(old_val, new_val) {
+                        Some(d) => changed.push((k.clone(), format!("{new_val} ({d})"))),
+                        None => changed.push((k.clone(), new_val.clone())),
+                    }
+                }
+            }
+        }
+        out.push(reply_container(id, chat, format_status(turn, &changed)));
+        if let Ok(s) = stores.guild(&guild_key).await {
+            let _ = s
+                .set_status_snapshot(&guild_key, &channel, &char_name, &flat)
+                .await;
+        }
     }
-    vec![proxy_container(id, chat, text, key, char_name, avatar, msg_id)]
+    out
 }
 
 #[cfg(test)]
@@ -1368,9 +1573,37 @@ mod tests {
             Some(RpCmd::SetChar { name: "alice".into(), key: "global".into(), value: "true".into() })
         );
         assert_eq!(parse_rp_command("alice avatar"), Some(RpCmd::SetAvatar { name: "alice".into() }));
+        assert_eq!(parse_rp_command("detailed on"), Some(RpCmd::Detailed(true)));
+        assert_eq!(parse_rp_command("detailed OFF"), Some(RpCmd::Detailed(false)));
+        assert_eq!(parse_rp_command("detailed yes"), Some(RpCmd::Detailed(true)));
+        assert_eq!(parse_rp_command("detailed 0"), Some(RpCmd::Detailed(false)));
+        assert_eq!(parse_rp_command("detailed"), None);
+        assert_eq!(parse_rp_command("detailed maybe"), None);
         assert_eq!(parse_rp_command(""), None);
         assert_eq!(parse_rp_command("alice"), None);
         assert_eq!(parse_rp_command("alice set noequals"), None);
+    }
+
+    #[test]
+    fn format_status_renders_signed_deltas() {
+        assert_eq!(
+            format_status(
+                42,
+                &[("HP".into(), "18 (-2)".into()), ("Stamina".into(), "7 (+1)".into())]
+            ),
+            "-# Turn 42 · HP 18 (-2) · Stamina 7 (+1)"
+        );
+        // No stats changed → just the turn number.
+        assert_eq!(format_status(42, &[]), "-# Turn 42");
+    }
+
+    #[test]
+    fn stat_delta_parses_numbers() {
+        assert_eq!(stat_delta("20", "18"), Some("-2".to_string()));
+        assert_eq!(stat_delta("6", "7"), Some("+1".to_string()));
+        assert_eq!(stat_delta("1.5", "2.0"), Some("+0.5".to_string()));
+        assert_eq!(stat_delta("good", "bad"), None);
+        assert_eq!(stat_delta("1", "x"), None);
     }
 
     #[test]
@@ -1638,5 +1871,117 @@ mod tests {
         assert!(sends(&out)[0].msg.contains("Unknown setting"), "{}", sends(&out)[0].msg);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn detailed_defaults_off_and_persists() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let path = dir.to_string_lossy().to_string();
+        {
+            let mut stores = Stores::new(path.clone());
+            let s = stores.guild("g").await.unwrap();
+            assert!(!s.detailed("g", "c").await, "detailed should default off");
+            s.set_detailed("g", "c", true).await.unwrap();
+            assert!(s.detailed("g", "c").await);
+        }
+        // A fresh Stores over the same dir still sees the flag.
+        let mut stores = Stores::new(path);
+        assert!(stores.guild("g").await.unwrap().detailed("g", "c").await);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Seed the `state` module's per-guild DB with a character's stats.
+    async fn seed_state(state_dir: &str, guild: &str, character: &str, stats: &[(&str, &str, &str)]) {
+        std::fs::create_dir_all(state_dir).unwrap();
+        let path = format!("{}/{guild}.db", state_dir.trim_end_matches('/'));
+        let db = turso::Builder::new_local(path.as_str()).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS stats (\
+             character TEXT NOT NULL, category TEXT NOT NULL, \
+             skey TEXT NOT NULL, svalue TEXT NOT NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+        for (cat, k, v) in stats {
+            let json = serde_json::to_string(v).unwrap();
+            conn.execute(
+                "DELETE FROM stats WHERE character = ?1 AND skey = ?2",
+                turso::params![vtext(character), vtext(k)],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO stats (character, category, skey, svalue) VALUES (?1, ?2, ?3, ?4)",
+                turso::params![vtext(character), vtext(cat), vtext(k), vtext(&json)],
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn detailed_emits_status_after_proxy() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let state_dir = std::env::temp_dir().join(format!("cockatiel-rp-state-{}", uuid::Uuid::now_v7()));
+        let state_str = state_dir.to_string_lossy().to_string();
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let mut sent: HashSet<String> = HashSet::new();
+        let id = test_identity();
+        let (user, channel, guild) = ("u1", "chan", "guild1");
+        let mut n = 0;
+        let mut say = |text: &str| {
+            n += 1;
+            discord_msg(user, channel, guild, &format!("m{n}"), text)
+        };
+
+        handle_message(&id, &say("!rp create Alice"), &mut stores, &mut sent, "!", &state_str).await;
+        handle_message(&id, &say("!rp possess Alice"), &mut stores, &mut sent, "!", &state_str).await;
+        handle_message(&id, &say("!rp start"), &mut stores, &mut sent, "!", &state_str).await;
+
+        // Turn detailed on for the channel.
+        let out = handle_message(&id, &say("!rp detailed on"), &mut stores, &mut sent, "!", &state_str).await;
+        assert!(
+            sends(&out)[0].msg.contains("Detailed status is now on"),
+            "{}",
+            sends(&out)[0].msg
+        );
+        assert!(stores.guild(guild).await.unwrap().detailed(guild, channel).await);
+
+        // A missing/unparseable argument yields a usage line.
+        let out = handle_message(&id, &say("!rp detailed maybe"), &mut stores, &mut sent, "!", &state_str).await;
+        assert!(sends(&out)[0].msg.contains("Usage"), "{}", sends(&out)[0].msg);
+
+        // First proxied message: no prior snapshot → just the turn number.
+        seed_state(&state_str, guild, "Alice", &[("vitals", "HP", "20"), ("vitals", "Stamina", "6")]).await;
+        let out = handle_message(&id, &say("hello world"), &mut stores, &mut sent, "!", &state_str).await;
+        let s = sends(&out);
+        assert_eq!(s.len(), 2, "expected a proxy + a status send");
+        assert!(s[0].proxy.is_some());
+        assert_eq!(s[0].delete_message_id, "m6");
+        assert!(s[1].proxy.is_none(), "the status message is a plain bot send");
+        assert!(s[1].delete_message_id.is_empty());
+        assert_eq!(s[1].platform, "discord");
+        assert_eq!(s[1].channel_id, "chan");
+        assert!(s[1].msg.contains("-# Turn 1"), "{}", s[1].msg);
+
+        // Second proxied message: stats changed → signed deltas, turn bumped.
+        seed_state(&state_str, guild, "Alice", &[("vitals", "HP", "18"), ("vitals", "Stamina", "7")]).await;
+        let out = handle_message(&id, &say("hello again"), &mut stores, &mut sent, "!", &state_str).await;
+        let s = sends(&out);
+        assert_eq!(s.len(), 2);
+        assert!(s[1].proxy.is_none());
+        assert_eq!(s[1].msg, "-# Turn 2 · HP 18 (-2) · Stamina 7 (+1)");
+
+        // Turning it off stops the status; only the proxy remains.
+        let out = handle_message(&id, &say("!rp detailed off"), &mut stores, &mut sent, "!", &state_str).await;
+        assert!(sends(&out)[0].msg.contains("Detailed status is now off"));
+        let out = handle_message(&id, &say("hello once more"), &mut stores, &mut sent, "!", &state_str).await;
+        assert_eq!(sends(&out).len(), 1, "detailed off → no status send");
+        assert!(sends(&out)[0].proxy.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 }
