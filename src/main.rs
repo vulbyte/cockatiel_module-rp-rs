@@ -52,9 +52,14 @@ const DM_DB: &str = "_dm";
 struct Settings {
     command_flag: String,
     db_dir: String,
+    /// Where the `state` module keeps its per-server DBs — the character sheet
+    /// reads a character's stats from there (best-effort).
+    state_db_dir: String,
     reconnect_base_secs: u32,
     reconnect_max_secs: u32,
 }
+
+const DEFAULT_STATE_DB_DIR: &str = "~/.cockatiel/state";
 
 /// Read `module_specific`, filling any missing keys with defaults and writing
 /// them back so every knob is editable in place in the module manager.
@@ -78,6 +83,11 @@ fn ensure_defaults() -> Settings {
         .and_then(|v| v.as_str())
         .unwrap_or(DEFAULT_DB_DIR)
         .to_string();
+    let state_db_dir = ms
+        .get("state_db_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or(DEFAULT_STATE_DB_DIR)
+        .to_string();
     let reconnect_base_secs = ms
         .get("reconnect_base_secs")
         .and_then(|v| v.as_u64())
@@ -99,6 +109,8 @@ fn ensure_defaults() -> Settings {
                     .or_insert_with(|| serde_json::json!(command_flag));
                 ms.entry("db_dir".to_string())
                     .or_insert_with(|| serde_json::json!(db_dir));
+                ms.entry("state_db_dir".to_string())
+                    .or_insert_with(|| serde_json::json!(state_db_dir));
                 ms.entry("reconnect_base_secs".to_string())
                     .or_insert_with(|| serde_json::json!(reconnect_base_secs));
                 ms.entry("reconnect_max_secs".to_string())
@@ -110,6 +122,7 @@ fn ensure_defaults() -> Settings {
     Settings {
         command_flag,
         db_dir,
+        state_db_dir,
         reconnect_base_secs,
         reconnect_max_secs,
     }
@@ -169,6 +182,7 @@ enum RpCmd {
     Help,
     SetChar { name: String, key: String, value: String },
     SetAvatar { name: String },
+    Sheet(String),
 }
 
 /// Parse the args (already stripped of `!rp`) into a subcommand.
@@ -187,6 +201,7 @@ fn parse_rp_command(args: &str) -> Option<RpCmd> {
         "possess" => (!rest.is_empty()).then(|| RpCmd::Possess(rest.to_string())),
         "create" => (!rest.is_empty()).then(|| RpCmd::Create(rest.to_string())),
         "delete" => (!rest.is_empty()).then(|| RpCmd::Delete(rest.to_string())),
+        "sheet" | "info" | "show" => (!rest.is_empty()).then(|| RpCmd::Sheet(rest.to_string())),
         // Otherwise the head is a character NAME followed by a verb.
         _ => {
             let name = head.to_string();
@@ -196,6 +211,7 @@ fn parse_rp_command(args: &str) -> Option<RpCmd> {
             };
             match verb.to_ascii_lowercase().as_str() {
                 "avatar" => Some(RpCmd::SetAvatar { name }),
+                "sheet" | "info" | "show" => Some(RpCmd::Sheet(name)),
                 "set" => {
                     let (k, v) = tail.split_once('=')?;
                     let k = k.trim();
@@ -259,6 +275,20 @@ fn vint(i: i64) -> turso::Value {
 
 /// One SQLite (turso) database: a server's characters + possession state, or the
 /// global characters.
+/// A character's identity + usage counters (for the sheet).
+#[derive(Debug, Clone, Default)]
+struct CharacterInfo {
+    name: String,
+    color: String,
+    pronouns: String,
+    bio: String,
+    tags: String,
+    group: String,
+    created_at: i64,
+    turns: i64,
+    has_avatar: bool,
+}
+
 struct Store {
     conn: turso::Connection,
 }
@@ -283,12 +313,44 @@ impl Store {
             .execute(
                 "CREATE TABLE IF NOT EXISTS characters (\
                  user_uuid7 TEXT NOT NULL, name TEXT NOT NULL, avatar BLOB, \
+                 color TEXT NOT NULL DEFAULT '', pronouns TEXT NOT NULL DEFAULT '', \
+                 bio TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', \
+                 grp TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0, \
+                 turns INTEGER NOT NULL DEFAULT 0, \
                  updated_at INTEGER NOT NULL DEFAULT 0, \
                  PRIMARY KEY (user_uuid7, name))",
                 (),
             )
             .await
             .map_err(|e| e.to_string())?;
+        // Older tables predate the identity columns; add only the missing ones.
+        // Running an ALTER for a column that already exists makes turso 0.1.0
+        // poison its schema cache so that later UPDATEs silently no-op (they
+        // report rows-changed but store nothing) — so never run a doomed ALTER.
+        let mut existing: HashSet<String> = HashSet::new();
+        if let Ok(mut rows) = self.conn.query("PRAGMA table_info(characters)", ()).await {
+            while let Ok(Some(r)) = rows.next().await {
+                if let Ok(n) = r.get::<String>(1) {
+                    existing.insert(n);
+                }
+            }
+        }
+        for (col, decl) in [
+            ("color", "TEXT NOT NULL DEFAULT ''"),
+            ("pronouns", "TEXT NOT NULL DEFAULT ''"),
+            ("bio", "TEXT NOT NULL DEFAULT ''"),
+            ("tags", "TEXT NOT NULL DEFAULT ''"),
+            ("grp", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("turns", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !existing.contains(col) {
+                let _ = self
+                    .conn
+                    .execute(&format!("ALTER TABLE characters ADD COLUMN {col} {decl}"), ())
+                    .await;
+            }
+        }
         self.conn
             .execute(
                 "CREATE TABLE IF NOT EXISTS possession (\
@@ -330,14 +392,29 @@ impl Store {
     }
 
     async fn set_avatar(&self, user: &str, name: &str, avatar: &[u8]) -> Result<(), String> {
+        let Some(info) = self.character_info(user, name).await? else {
+            return Err(format!("no character named `{name}`"));
+        };
+        self.save(user, name, &info, Some(avatar)).await
+    }
+
+    /// Persist a full row. turso 0.1.0's `UPDATE` silently fails to persist
+    /// (it reports rows-changed but the stored value never changes), so every
+    /// mutation is a read-modify-write via DELETE + INSERT — the same
+    /// workaround `set_possession` uses.
+    async fn save(&self, user: &str, name: &str, info: &CharacterInfo, avatar: Option<&[u8]>) -> Result<(), String> {
+        self.delete_character(user, name).await?;
+        let avatar = avatar.map(|b| turso::Value::Blob(b.to_vec())).unwrap_or(turso::Value::Null);
         self.conn
             .execute(
-                "UPDATE characters SET avatar = ?3, updated_at = ?4 WHERE user_uuid7 = ?1 AND name = ?2",
+                "INSERT INTO characters \
+                 (user_uuid7, name, avatar, color, pronouns, bio, tags, grp, created_at, turns, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 turso::params![
-                    vtext(user),
-                    vtext(name),
-                    turso::Value::Blob(avatar.to_vec()),
-                    vint(now_ms())
+                    vtext(user), vtext(name), avatar,
+                    vtext(&info.color), vtext(&info.pronouns), vtext(&info.bio),
+                    vtext(&info.tags), vtext(&info.group),
+                    vint(info.created_at), vint(info.turns), vint(now_ms())
                 ],
             )
             .await
@@ -360,6 +437,67 @@ impl Store {
         };
         while rows.next().await.map_err(|e| e.to_string())?.is_some() {}
         Ok(out)
+    }
+
+    /// A character's full identity record, or None if it doesn't exist here.
+    async fn character_info(&self, user: &str, name: &str) -> Result<Option<CharacterInfo>, String> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT color, pronouns, bio, tags, grp, created_at, turns, avatar \
+                 FROM characters WHERE user_uuid7 = ?1 AND name = ?2",
+                turso::params![vtext(user), vtext(name)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let out = rows.next().await.map_err(|e| e.to_string())?.map(|r| CharacterInfo {
+            name: name.to_string(),
+            color: r.get::<String>(0).unwrap_or_default(),
+            pronouns: r.get::<String>(1).unwrap_or_default(),
+            bio: r.get::<String>(2).unwrap_or_default(),
+            tags: r.get::<String>(3).unwrap_or_default(),
+            group: r.get::<String>(4).unwrap_or_default(),
+            created_at: r.get::<i64>(5).unwrap_or(0),
+            turns: r.get::<i64>(6).unwrap_or(0),
+            has_avatar: r.get::<Option<Vec<u8>>>(7).ok().flatten().map(|b| !b.is_empty()).unwrap_or(false),
+        });
+        while rows.next().await.map_err(|e| e.to_string())?.is_some() {}
+        Ok(out)
+    }
+
+    /// Set one identity field; `field` is whitelisted → a column name. Returns
+    /// whether the character exists in THIS store.
+    async fn set_field(&self, user: &str, name: &str, field: &str, value: &str) -> Result<bool, String> {
+        let col = match field {
+            "color" | "colour" => "color",
+            "pronouns" => "pronouns",
+            "bio" => "bio",
+            "tags" => "tags",
+            "group" | "grp" => "grp",
+            _ => return Ok(false),
+        };
+        let Some(mut info) = self.character_info(user, name).await? else {
+            return Ok(false);
+        };
+        match col {
+            "color" => info.color = value.to_string(),
+            "pronouns" => info.pronouns = value.to_string(),
+            "bio" => info.bio = value.to_string(),
+            "tags" => info.tags = value.to_string(),
+            _ => info.group = value.to_string(),
+        }
+        let avatar = self.get_avatar(user, name).await?;
+        self.save(user, name, &info, avatar.as_deref()).await?;
+        Ok(true)
+    }
+
+    /// Bump a character's turn counter (once per proxied message).
+    async fn bump_turns(&self, user: &str, name: &str) {
+        if let Ok(Some(mut info)) = self.character_info(user, name).await {
+            info.turns += 1;
+            let avatar = self.get_avatar(user, name).await.ok().flatten();
+            let _ = self.save(user, name, &info, avatar.as_deref()).await;
+        }
     }
 
     async fn delete_character(&self, user: &str, name: &str) -> Result<(), String> {
@@ -632,12 +770,130 @@ async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Str
 /// Handle one `!rp` command, returning the engine messages to send (the
 /// feedback replies). Async only for the store + attachment fetch, so the whole
 /// command flow is drivable in a test.
+/// Format epoch-ms as `YYYY-MM-DD` (UTC). 0/negative → "unknown".
+fn fmt_date(ms: i64) -> String {
+    if ms <= 0 {
+        return "unknown".to_string();
+    }
+    let days = ms.div_euclid(86_400_000);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Read a character's stats from the `state` module's DB for this server,
+/// grouped by category then key (both alphabetical). Best-effort: any error →
+/// empty, so the sheet simply omits the stats section.
+async fn read_state_stats(state_db_dir: &str, guild: &str, character: &str) -> Vec<(String, Vec<(String, String)>)> {
+    let key = if guild.is_empty() { "_dm" } else { guild };
+    let path = format!("{}/{key}.db", expand_tilde(state_db_dir).trim_end_matches('/'));
+    if !std::path::Path::new(&path).exists() {
+        return Vec::new();
+    }
+    let Ok(db) = turso::Builder::new_local(path.as_str()).build().await else {
+        return Vec::new();
+    };
+    let Ok(conn) = db.connect() else {
+        return Vec::new();
+    };
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT category, skey, svalue FROM stats WHERE character = ?1 ORDER BY category ASC, skey ASC",
+            turso::params![vtext(character)],
+        )
+        .await
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    while let Ok(Some(r)) = rows.next().await {
+        let category = r.get::<String>(0).unwrap_or_default();
+        let k = r.get::<String>(1).unwrap_or_default();
+        let sv = r.get::<String>(2).unwrap_or_default();
+        let val = serde_json::from_str::<serde_json::Value>(&sv)
+            .map(|v| match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            })
+            .unwrap_or(sv);
+        match out.iter_mut().find(|(c, _)| *c == category) {
+            Some((_, v)) => v.push((k, val)),
+            None => out.push((category, vec![(k, val)])),
+        }
+    }
+    out
+}
+
+/// Build a character's sheet: identity, usage counters, and its stats from the
+/// `state` module (grouped by category, alphabetical).
+async fn render_sheet(stores: &mut Stores, state_db_dir: &str, user: &str, name: &str, guild: &str) -> String {
+    let mut info = None;
+    let mut is_global = false;
+    if let Ok(s) = stores.guild(guild).await {
+        if let Ok(Some(i)) = s.character_info(user, name).await {
+            info = Some(i);
+        }
+    }
+    if info.is_none() {
+        if let Ok(g) = stores.global_store().await {
+            if let Ok(Some(i)) = g.character_info(user, name).await {
+                info = Some(i);
+                is_global = true;
+            }
+        }
+    }
+    let Some(info) = info else {
+        return format!("No character named `{name}`.");
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut head = format!("**{}**", info.name);
+    if !info.pronouns.is_empty() {
+        head.push_str(&format!(" · {}", info.pronouns));
+    }
+    if !info.color.is_empty() {
+        head.push_str(&format!(" · {}", info.color));
+    }
+    if !info.group.is_empty() {
+        head.push_str(&format!(" · [{}]", info.group));
+    }
+    if is_global {
+        head.push_str(" · global");
+    }
+    lines.push(head);
+    if info.has_avatar {
+        lines.push("avatar: set".to_string());
+    }
+    if !info.tags.is_empty() {
+        lines.push(format!("tags: {}", info.tags));
+    }
+    if !info.bio.is_empty() {
+        lines.push(info.bio.clone());
+    }
+    lines.push(format!("created {} · {} turn(s)", fmt_date(info.created_at), info.turns));
+
+    for (category, items) in read_state_stats(state_db_dir, guild, name).await {
+        let body = items.iter().map(|(k, v)| format!("`{k}`={v}")).collect::<Vec<_>>().join(" · ");
+        lines.push(format!("— {category}: {body}"));
+    }
+    lines.join("\n")
+}
+
 async fn handle_command(
     id: &EngineIdentity,
     chat: &ChatMessage,
     stores: &mut Stores,
     sent_avatars: &mut HashSet<String>,
     guild: &str,
+    state_db_dir: &str,
     cmd: RpCmd,
 ) -> Vec<ContainerForEngine> {
     let mut out: Vec<ContainerForEngine> = Vec::new();
@@ -655,7 +911,7 @@ async fn handle_command(
     match cmd {
         RpCmd::Help => {
             push!(format!(
-                "RP: `{f}rp possess <char>` · `{f}rp start`/`stop` · `{f}rp create <char>` (attach an image for the avatar) · `{f}rp <char> set global=true` · `{f}rp list` · `{f}rp <char> delete`",
+                "RP: `{f}rp possess <char>` · `{f}rp start`/`stop` · `{f}rp create <char>` (attach an image for the avatar) · `{f}rp <char> set color=… pronouns=… bio=… tags=… group=… global=true` · `{f}rp <char> sheet` · `{f}rp list` · `{f}rp <char> delete`",
                 f = DEFAULT_FLAG
             ));
         }
@@ -788,9 +1044,32 @@ async fn handle_command(
                     }
                     None => push!("`global` must be true or false.".to_string()),
                 }
+            } else if ["color", "colour", "pronouns", "bio", "tags", "group", "grp"].contains(&key.to_ascii_lowercase().as_str()) {
+                let field = key.to_ascii_lowercase();
+                let mut done = false;
+                if let Ok(s) = stores.guild(guild).await {
+                    if s.set_field(&user, &name, &field, &value).await.unwrap_or(false) {
+                        done = true;
+                    }
+                }
+                if !done {
+                    if let Ok(g) = stores.global_store().await {
+                        if g.set_field(&user, &name, &field, &value).await.unwrap_or(false) {
+                            done = true;
+                        }
+                    }
+                }
+                push!(if done {
+                    format!("Set `{field}` on `{name}`.")
+                } else {
+                    format!("No character named `{name}`.")
+                });
             } else {
-                push!(format!("Unknown setting `{key}`. Try `global=true`."));
+                push!(format!("Unknown setting `{key}`. Try: color, pronouns, bio, tags, group, global."));
             }
+        }
+        RpCmd::Sheet(name) => {
+            push!(render_sheet(stores, state_db_dir, &user, &name, guild).await);
         }
         RpCmd::Possess(name) => {
             if !stores.character_exists_any(guild, &user, &name).await {
@@ -933,7 +1212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(chat) = &process.raw_message {
                             for c in handle_message(
                                 &id, chat, &mut stores, &mut sent_avatars,
-                                &settings.command_flag,
+                                &settings.command_flag, &settings.state_db_dir,
                             )
                             .await
                             {
@@ -1003,6 +1282,7 @@ async fn handle_message(
     stores: &mut Stores,
     sent_avatars: &mut HashSet<String>,
     command_flag: &str,
+    state_db_dir: &str,
 ) -> Vec<ContainerForEngine> {
     if chat.platform != "discord" || chat.user_uuid7.is_empty() {
         return Vec::new();
@@ -1015,7 +1295,7 @@ async fn handle_message(
     // A `!rp` command (parsed here — the module is a catch-all, not a command owner).
     if let Some(args) = parse_rp_args(&chat.raw_message, command_flag, RP_COMMAND) {
         if let Some(cmd) = parse_rp_command(&args) {
-            return handle_command(id, chat, stores, sent_avatars, &guild_key, cmd).await;
+            return handle_command(id, chat, stores, sent_avatars, &guild_key, state_db_dir, cmd).await;
         }
         return Vec::new();
     }
@@ -1042,6 +1322,10 @@ async fn handle_message(
         }
         a
     };
+    // Count this as one turn the character has been used.
+    if let Ok(s) = stores.guild(&guild_key).await {
+        s.bump_turns(&user, &char_name).await;
+    }
     vec![proxy_container(id, chat, text, key, char_name, avatar, msg_id)]
 }
 
@@ -1124,6 +1408,15 @@ mod tests {
         assert_eq!(expand_tilde("/abs/path"), "/abs/path");
     }
 
+    #[test]
+    fn fmt_date_renders_utc_ymd() {
+        assert_eq!(fmt_date(0), "unknown");
+        assert_eq!(fmt_date(-5), "unknown");
+        assert_eq!(fmt_date(1), "1970-01-01");
+        assert_eq!(fmt_date(1_609_459_200_000), "2021-01-01");
+        assert_eq!(fmt_date(951_782_400_000), "2000-02-29"); // a leap day
+    }
+
     // ── end-to-end: pretend to be a Discord chat ────────────────────────────
 
     /// A `ChatMessage` exactly as the discord-adapter emits it for a
@@ -1181,13 +1474,13 @@ mod tests {
             discord_msg(user, channel, guild, &format!("m{n}"), text)
         };
         // 1. create
-        let out = handle_message(&id, &say("!rp create Alice"), &mut stores, &mut sent, "!").await;
+        let out = handle_message(&id, &say("!rp create Alice"), &mut stores, &mut sent, "!", "").await;
         assert_eq!(sends(&out).len(), 1);
         assert!(sends(&out)[0].msg.contains("Created `Alice`"), "{}", sends(&out)[0].msg);
         assert!(stores.character_exists_any(guild, user, "Alice").await);
 
         // 2. possess
-        let out = handle_message(&id, &say("!rp possess Alice"), &mut stores, &mut sent, "!").await;
+        let out = handle_message(&id, &say("!rp possess Alice"), &mut stores, &mut sent, "!", "").await;
         assert!(sends(&out)[0].msg.contains("Possessing `Alice`"));
         assert_eq!(
             possession_of(&mut stores, guild, user, channel).await,
@@ -1195,10 +1488,10 @@ mod tests {
         );
 
         // 3. a normal message while NOT started → nothing proxied
-        assert!(handle_message(&id, &say("hello"), &mut stores, &mut sent, "!").await.is_empty());
+        assert!(handle_message(&id, &say("hello"), &mut stores, &mut sent, "!", "").await.is_empty());
 
         // 4. start
-        let out = handle_message(&id, &say("!rp start"), &mut stores, &mut sent, "!").await;
+        let out = handle_message(&id, &say("!rp start"), &mut stores, &mut sent, "!", "").await;
         assert!(sends(&out)[0].msg.contains("Started"));
         assert_eq!(
             possession_of(&mut stores, guild, user, channel).await,
@@ -1206,7 +1499,7 @@ mod tests {
         );
 
         // 5. a normal message while started → a PROXY send that deletes the trigger
-        let out = handle_message(&id, &say("hello world"), &mut stores, &mut sent, "!").await;
+        let out = handle_message(&id, &say("hello world"), &mut stores, &mut sent, "!", "").await;
         let s = sends(&out);
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].msg, "hello world");
@@ -1220,40 +1513,129 @@ mod tests {
 
         // 6. a whole-message spoiler → bypassed (nothing sent)
         assert!(
-            handle_message(&id, &say("||out of character||"), &mut stores, &mut sent, "!")
+            handle_message(&id, &say("||out of character||"), &mut stores, &mut sent, "!", "")
                 .await
                 .is_empty(),
             "a spoilered message posts normally, so we emit nothing"
         );
 
         // 7. list
-        let out = handle_message(&id, &say("!rp list"), &mut stores, &mut sent, "!").await;
+        let out = handle_message(&id, &say("!rp list"), &mut stores, &mut sent, "!", "").await;
         assert!(sends(&out)[0].msg.contains("Alice"));
 
         // 8. stop → messages post normally again
-        let out = handle_message(&id, &say("!rp stop"), &mut stores, &mut sent, "!").await;
+        let out = handle_message(&id, &say("!rp stop"), &mut stores, &mut sent, "!", "").await;
         assert!(sends(&out)[0].msg.contains("Stopped"));
-        assert!(handle_message(&id, &say("back to normal"), &mut stores, &mut sent, "!").await.is_empty());
+        assert!(handle_message(&id, &say("back to normal"), &mut stores, &mut sent, "!", "").await.is_empty());
 
         // 9. set global=true → the character moves to the global DB, still usable
-        let out = handle_message(&id, &say("!rp Alice set global=true"), &mut stores, &mut sent, "!").await;
+        let out = handle_message(&id, &say("!rp Alice set global=true"), &mut stores, &mut sent, "!", "").await;
         assert!(sends(&out)[0].msg.contains("now global"));
         assert!(stores.character_exists_any(guild, user, "Alice").await);
-        handle_message(&id, &say("!rp possess Alice"), &mut stores, &mut sent, "!").await;
-        handle_message(&id, &say("!rp start"), &mut stores, &mut sent, "!").await;
-        let out = handle_message(&id, &say("hi again"), &mut stores, &mut sent, "!").await;
+        handle_message(&id, &say("!rp possess Alice"), &mut stores, &mut sent, "!", "").await;
+        handle_message(&id, &say("!rp start"), &mut stores, &mut sent, "!", "").await;
+        let out = handle_message(&id, &say("hi again"), &mut stores, &mut sent, "!", "").await;
         assert_eq!(sends(&out)[0].proxy.as_ref().unwrap().display_name, "Alice");
 
         // 10. delete
-        handle_message(&id, &say("!rp stop"), &mut stores, &mut sent, "!").await;
-        let out = handle_message(&id, &say("!rp delete Alice"), &mut stores, &mut sent, "!").await;
+        handle_message(&id, &say("!rp stop"), &mut stores, &mut sent, "!", "").await;
+        let out = handle_message(&id, &say("!rp delete Alice"), &mut stores, &mut sent, "!", "").await;
         assert!(sends(&out)[0].msg.contains("Deleted"));
         assert!(!stores.character_exists_any(guild, user, "Alice").await);
 
         // 11. commands are ignored for non-discord platforms
         let mut non = discord_msg(user, channel, guild, "z", "!rp start");
         non.platform = "twitch".into();
-        assert!(handle_message(&id, &non, &mut stores, &mut sent, "!").await.is_empty());
+        assert!(handle_message(&id, &non, &mut stores, &mut sent, "!", "").await.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh DB runs the migration check. If a doomed `ALTER` ran, turso
+    /// 0.1.0 would poison its schema cache and this `UPDATE` would report
+    /// rows-changed but store nothing.
+    #[tokio::test]
+    async fn migrations_do_not_poison_updates() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let s = stores.guild("g").await.unwrap();
+        s.create_character("u", "A", None).await.unwrap();
+        s.conn
+            .execute("UPDATE characters SET color='#abc' WHERE user_uuid7='u' AND name='A'", ())
+            .await
+            .unwrap();
+        let mut rows = s
+            .conn
+            .query("SELECT color FROM characters WHERE user_uuid7='u' AND name='A'", ())
+            .await
+            .unwrap();
+        let got = rows.next().await.unwrap().unwrap().get::<String>(0).unwrap();
+        assert_eq!(got, "#abc", "UPDATE was poisoned by a failing ALTER");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_field_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let s = stores.guild("g").await.unwrap();
+        s.create_character("u", "A", None).await.unwrap();
+        let ok = s.set_field("u", "A", "color", "#f0f").await.unwrap();
+        assert!(ok, "set_field returned false");
+        let info = s.character_info("u", "A").await.unwrap().unwrap();
+        assert_eq!(info.color, "#f0f");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn identity_fields_and_sheet() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let mut sent: HashSet<String> = HashSet::new();
+        let id = test_identity();
+        let (user, channel, guild) = ("u1", "chan", "guild1");
+        let mut n = 0;
+        let mut say = |text: &str| {
+            n += 1;
+            discord_msg(user, channel, guild, &format!("m{n}"), text)
+        };
+        handle_message(&id, &say("!rp create Alice"), &mut stores, &mut sent, "!", "").await;
+
+        // Identity fields, including the `colour` alias.
+        for line in [
+            "!rp Alice set color=#f0f",
+            "!rp Alice set pronouns=she/her",
+            "!rp Alice set bio=A wanderer.",
+            "!rp Alice set tags=brave, kind",
+            "!rp Alice set group=Party",
+        ] {
+            let out = handle_message(&id, &say(line), &mut stores, &mut sent, "!", "").await;
+            assert!(sends(&out)[0].msg.contains("Set"), "{line} -> {}", sends(&out)[0].msg);
+        }
+
+        // The sheet renders them (both `Alice sheet` and `sheet Alice` forms).
+        for line in ["!rp Alice sheet", "!rp sheet Alice"] {
+            let out = handle_message(&id, &say(line), &mut stores, &mut sent, "!", "").await;
+            let msg = &sends(&out)[0].msg;
+            assert!(
+                msg.contains("Alice")
+                    && msg.contains("she/her")
+                    && msg.contains("#f0f")
+                    && msg.contains("A wanderer.")
+                    && msg.contains("Party"),
+                "{line} -> {msg}"
+            );
+        }
+
+        // Missing character: reported, never a panic.
+        let out = handle_message(&id, &say("!rp Ghost set bio=x"), &mut stores, &mut sent, "!", "").await;
+        assert!(sends(&out)[0].msg.contains("No character"));
+        let out = handle_message(&id, &say("!rp Ghost sheet"), &mut stores, &mut sent, "!", "").await;
+        assert!(sends(&out)[0].msg.contains("No character"));
+
+        // An unknown setting key suggests the valid ones.
+        let out = handle_message(&id, &say("!rp Alice set nope=1"), &mut stores, &mut sent, "!", "").await;
+        assert!(sends(&out)[0].msg.contains("Unknown setting"), "{}", sends(&out)[0].msg);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
