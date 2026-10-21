@@ -21,6 +21,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -171,7 +172,7 @@ fn is_spoiler_bypass(text: &str) -> bool {
 }
 
 /// A parsed `!rp` subcommand.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum RpCmd {
     Possess(String),
     Start,
@@ -184,6 +185,11 @@ enum RpCmd {
     SetAvatar { name: String },
     Sheet(String),
     Detailed(bool),
+    EventAdd { text: String, target: String, effects: Vec<Effect> },
+    EventList,
+    EventDel(String),
+    EventDraw(Option<String>),
+    EventChance(u32),
 }
 
 /// Parse the args (already stripped of `!rp`) into a subcommand.
@@ -204,6 +210,7 @@ fn parse_rp_command(args: &str) -> Option<RpCmd> {
         "create" => (!rest.is_empty()).then(|| RpCmd::Create(rest.to_string())),
         "delete" => (!rest.is_empty()).then(|| RpCmd::Delete(rest.to_string())),
         "sheet" | "info" | "show" => (!rest.is_empty()).then(|| RpCmd::Sheet(rest.to_string())),
+        "event" => parse_event_command(rest),
         // Otherwise the head is a character NAME followed by a verb.
         _ => {
             let name = head.to_string();
@@ -230,6 +237,72 @@ fn parse_rp_command(args: &str) -> Option<RpCmd> {
             }
         }
     }
+}
+
+/// Parse the args after `!rp event`. `add` takes free text up to the first
+/// `--flag`; a bare argument is an explicit draw target (`@char` or `char`).
+fn parse_event_command(rest: &str) -> Option<RpCmd> {
+    let rest = rest.trim();
+    let (sub, tail) = match rest.split_once(char::is_whitespace) {
+        Some((s, t)) => (s, t.trim()),
+        None => (rest, ""),
+    };
+    match sub.to_ascii_lowercase().as_str() {
+        "" => Some(RpCmd::EventDraw(None)),
+        "add" => parse_event_add(tail),
+        "list" => Some(RpCmd::EventList),
+        "del" | "delete" | "remove" => (!tail.is_empty()).then(|| RpCmd::EventDel(tail.to_string())),
+        "chance" => tail
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|p| *p <= 100)
+            .map(RpCmd::EventChance),
+        // Anything else is a draw with an explicit target name.
+        _ => Some(RpCmd::EventDraw(Some(rest.trim_start_matches('@').to_string()))),
+    }
+}
+
+/// Parse `add <text> [--target self|all|any] [--effect <key>=<±n>]...`. Text is
+/// everything up to the first `--flag`; text-only (pure meta) events are fine,
+/// but empty text is malformed.
+fn parse_event_add(rest: &str) -> Option<RpCmd> {
+    let mut it = rest.split_whitespace().peekable();
+    let mut text_parts: Vec<&str> = Vec::new();
+    while let Some(tok) = it.peek() {
+        if tok.starts_with("--") {
+            break;
+        }
+        text_parts.push(it.next().unwrap());
+    }
+    let text = text_parts.join(" ");
+    let mut target = "any".to_string();
+    let mut effects: Vec<Effect> = Vec::new();
+    while let Some(tok) = it.next() {
+        match tok {
+            "--target" => {
+                let v = it.next()?.to_ascii_lowercase();
+                if !["self", "all", "any"].contains(&v.as_str()) {
+                    return None;
+                }
+                target = v;
+            }
+            "--effect" => {
+                let (k, d) = it.next()?.split_once('=')?;
+                let k = k.trim();
+                if k.is_empty() {
+                    return None;
+                }
+                let delta: f64 = d.trim().parse().ok()?;
+                effects.push(Effect { key: k.to_string(), delta });
+            }
+            _ => return None,
+        }
+    }
+    if text.is_empty() {
+        return None;
+    }
+    Some(RpCmd::EventAdd { text, target, effects })
 }
 
 /// The stable per-character key the adapter caches its webhook under. Namespaced
@@ -314,6 +387,26 @@ struct CharacterInfo {
     has_avatar: bool,
 }
 
+/// A single stat mutation an event applies: add `delta` to stat `key`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct Effect {
+    key: String,
+    delta: f64,
+}
+
+/// A player-submitted random event ("GM event"): flavour text and/or a set of
+/// mechanical stat changes, drawn from a per-guild pool.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Event {
+    id: String,
+    text: String,
+    /// `self` | `all` | `any`.
+    target: String,
+    effects: Vec<Effect>,
+    author: String,
+    created_at: i64,
+}
+
 struct Store {
     conn: turso::Connection,
 }
@@ -391,7 +484,34 @@ impl Store {
                 "CREATE TABLE IF NOT EXISTS channel_settings (\
                  guild TEXT NOT NULL, channel_id TEXT NOT NULL, \
                  detailed INTEGER NOT NULL DEFAULT 0, \
+                 event_chance INTEGER NOT NULL DEFAULT 0, \
                  PRIMARY KEY (guild, channel_id))",
+                (),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        // Older channel_settings predate `event_chance`; add it only if absent
+        // (a doomed ALTER poisons turso 0.1.0's schema cache — see above).
+        let mut cs_cols: HashSet<String> = HashSet::new();
+        if let Ok(mut rows) = self.conn.query("PRAGMA table_info(channel_settings)", ()).await {
+            while let Ok(Some(r)) = rows.next().await {
+                if let Ok(n) = r.get::<String>(1) {
+                    cs_cols.insert(n);
+                }
+            }
+        }
+        if !cs_cols.contains("event_chance") {
+            let _ = self
+                .conn
+                .execute("ALTER TABLE channel_settings ADD COLUMN event_chance INTEGER NOT NULL DEFAULT 0", ())
+                .await;
+        }
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS events (\
+                 id TEXT NOT NULL PRIMARY KEY, text TEXT NOT NULL, \
+                 target TEXT NOT NULL DEFAULT 'any', effects TEXT NOT NULL DEFAULT '[]', \
+                 author TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0)",
                 (),
             )
             .await
@@ -568,9 +688,10 @@ impl Store {
         out
     }
 
-    /// Turn the per-channel detailed status on/off. DELETE + INSERT — turso
-    /// 0.1.0's `UPDATE` silently fails to persist.
+    /// Turn the per-channel detailed status on/off, preserving `event_chance`.
+    /// DELETE + INSERT — turso 0.1.0's `UPDATE` silently fails to persist.
     async fn set_detailed(&self, guild: &str, channel: &str, on: bool) -> Result<(), String> {
+        let chance = self.event_chance(guild, channel).await;
         self.conn
             .execute(
                 "DELETE FROM channel_settings WHERE guild = ?1 AND channel_id = ?2",
@@ -580,9 +701,140 @@ impl Store {
             .map_err(|e| e.to_string())?;
         self.conn
             .execute(
-                "INSERT INTO channel_settings (guild, channel_id, detailed) VALUES (?1, ?2, ?3)",
-                turso::params![vtext(guild), vtext(channel), vint(on as i64)],
+                "INSERT INTO channel_settings (guild, channel_id, detailed, event_chance) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                turso::params![vtext(guild), vtext(channel), vint(on as i64), vint(chance as i64)],
             )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// The per-channel auto-draw percentage (0 when unset).
+    async fn event_chance(&self, guild: &str, channel: &str) -> u32 {
+        let Ok(mut rows) = self
+            .conn
+            .query(
+                "SELECT event_chance FROM channel_settings WHERE guild = ?1 AND channel_id = ?2",
+                turso::params![vtext(guild), vtext(channel)],
+            )
+            .await
+        else {
+            return 0;
+        };
+        let out = match rows.next().await {
+            Ok(Some(r)) => r.get::<i64>(0).unwrap_or(0).max(0) as u32,
+            _ => 0,
+        };
+        while let Ok(Some(_)) = rows.next().await {}
+        out
+    }
+
+    /// Set the per-channel auto-draw percentage, preserving `detailed`
+    /// (read-modify-write via DELETE + INSERT — no upsert in turso 0.1.0).
+    async fn set_event_chance(&self, guild: &str, channel: &str, pct: u32) -> Result<(), String> {
+        let detailed = self.detailed(guild, channel).await;
+        self.conn
+            .execute(
+                "DELETE FROM channel_settings WHERE guild = ?1 AND channel_id = ?2",
+                turso::params![vtext(guild), vtext(channel)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "INSERT INTO channel_settings (guild, channel_id, detailed, event_chance) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                turso::params![
+                    vtext(guild),
+                    vtext(channel),
+                    vint(detailed as i64),
+                    vint(pct as i64)
+                ],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Every possessed+started character in a channel (deduplicated).
+    async fn active_characters(&self, channel: &str) -> Vec<String> {
+        let Ok(mut rows) = self
+            .conn
+            .query(
+                "SELECT char_name FROM possession WHERE channel_id = ?1 AND started = 1",
+                turso::params![vtext(channel)],
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Ok(Some(r)) = rows.next().await {
+            if let Ok(n) = r.get::<String>(0) {
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+        out
+    }
+
+    /// Insert an event into the pool.
+    async fn add_event(&self, ev: &Event) -> Result<(), String> {
+        let effects = serde_json::to_string(&ev.effects).map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "INSERT INTO events (id, text, target, effects, author, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                turso::params![
+                    vtext(&ev.id),
+                    vtext(&ev.text),
+                    vtext(&ev.target),
+                    vtext(&effects),
+                    vtext(&ev.author),
+                    vint(ev.created_at)
+                ],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Every event in the pool, oldest first.
+    async fn list_events(&self) -> Vec<Event> {
+        let Ok(mut rows) = self
+            .conn
+            .query(
+                "SELECT id, text, target, effects, author, created_at FROM events ORDER BY created_at ASC",
+                (),
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Ok(Some(r)) = rows.next().await {
+            out.push(Event {
+                id: r.get::<String>(0).unwrap_or_default(),
+                text: r.get::<String>(1).unwrap_or_default(),
+                target: r.get::<String>(2).unwrap_or_default(),
+                effects: r
+                    .get::<String>(3)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Vec<Effect>>(&s).ok())
+                    .unwrap_or_default(),
+                author: r.get::<String>(4).unwrap_or_default(),
+                created_at: r.get::<i64>(5).unwrap_or(0),
+            });
+        }
+        out
+    }
+
+    /// Remove an event by full id (the caller resolves short ids).
+    async fn delete_event(&self, id: &str) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM events WHERE id = ?1", turso::params![vtext(id)])
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -976,6 +1228,175 @@ async fn read_state_stats(state_db_dir: &str, guild: &str, character: &str) -> V
     out
 }
 
+/// The first 8 chars of a uuid7, for compact event listings.
+fn short_id(id: &str) -> &str {
+    let n = id.len().min(8);
+    &id[..n]
+}
+
+/// 64 pseudo-random bits. There is no RNG dependency, so derive them from the
+/// random tail of a fresh uuid7 (bytes 8..16 are the 62 random `rand_b` bits).
+fn random_u64() -> u64 {
+    let bytes = uuid::Uuid::now_v7();
+    let b = bytes.as_bytes();
+    let mut x: u64 = 0;
+    for &byte in &b[8..16] {
+        x = (x << 8) | byte as u64;
+    }
+    x
+}
+
+/// A uniformly random index in `0..n` (0 for an empty pool).
+fn random_index(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        (random_u64() % n as u64) as usize
+    }
+}
+
+/// Roll a percentage chance (true `pct` times out of 100).
+fn roll_pct(pct: u32) -> bool {
+    (random_u64() % 100) < pct as u64
+}
+
+/// A stat value as a JSON number, if it is numeric (bools/strings are not).
+fn json_num(s: &str) -> Option<f64> {
+    serde_json::from_str::<serde_json::Value>(s).ok()?.as_f64()
+}
+
+/// Render a stat number as (JSON, display). Integers stay bare integers.
+fn render_num(n: f64, is_int: bool) -> (String, String) {
+    if is_int && n.fract() == 0.0 {
+        let i = n as i64;
+        (i.to_string(), i.to_string())
+    } else {
+        (n.to_string(), n.to_string())
+    }
+}
+
+/// Read one stat's category + raw JSON value from a state DB connection.
+async fn read_state_stat(conn: &turso::Connection, character: &str, key: &str) -> Option<(String, String)> {
+    let mut rows = conn
+        .query(
+            "SELECT category, svalue FROM stats WHERE character = ?1 AND skey = ?2",
+            turso::params![vtext(character), vtext(key)],
+        )
+        .await
+        .ok()?;
+    let r = rows.next().await.ok()??;
+    let category = r.get::<String>(0).unwrap_or_default();
+    let value = r.get::<String>(1).ok()?;
+    Some((category, value))
+}
+
+/// The (min, max) bounds for a stat key, if a constraint exists.
+async fn state_constraint(conn: &turso::Connection, key: &str) -> Option<(Option<f64>, Option<f64>)> {
+    let mut rows = conn
+        .query("SELECT cmin, cmax FROM constraints WHERE skey = ?1", turso::params![vtext(key)])
+        .await
+        .ok()?;
+    let r = rows.next().await.ok()??;
+    Some((
+        r.get::<Option<f64>>(0).ok().flatten(),
+        r.get::<Option<f64>>(1).ok().flatten(),
+    ))
+}
+
+/// Apply an event's effects to each target in the `state` module's per-guild DB
+/// and log a changelog row per change. Returns the display notes
+/// (`<char>: <key> <±delta>`) for the narration's subtext. Best-effort: a
+/// missing DB/stat is noted, never fatal. Does NOT fire the state module's
+/// triggers (accepted limitation).
+async fn apply_event_effects(
+    state_db_dir: &str,
+    guild: &str,
+    targets: &[String],
+    effects: &[Effect],
+    actor: &str,
+) -> Vec<String> {
+    let key = if guild.is_empty() { DM_DB } else { guild };
+    let path = format!("{}/{key}.db", expand_tilde(state_db_dir).trim_end_matches('/'));
+    if !std::path::Path::new(&path).exists() {
+        return Vec::new();
+    }
+    let Ok(db) = turso::Builder::new_local(path.as_str()).build().await else {
+        return Vec::new();
+    };
+    let Ok(conn) = db.connect() else {
+        return Vec::new();
+    };
+    let now = now_ms();
+    let mut notes: Vec<String> = Vec::new();
+    for target in targets {
+        for eff in effects {
+            let Some((category, raw)) = read_state_stat(&conn, target, &eff.key).await else {
+                notes.push(format!("{target}: {} (no such stat)", eff.key));
+                continue;
+            };
+            let Some(old_num) = json_num(&raw) else {
+                notes.push(format!("{target}: {} (not numeric)", eff.key));
+                continue;
+            };
+            let mut new_num = old_num + eff.delta;
+            if let Some((min, max)) = state_constraint(&conn, &eff.key).await {
+                if let Some(lo) = min {
+                    if new_num < lo {
+                        new_num = lo;
+                    }
+                }
+                if let Some(hi) = max {
+                    if new_num > hi {
+                        new_num = hi;
+                    }
+                }
+            }
+            let is_int = serde_json::from_str::<serde_json::Value>(&raw)
+                .map(|v| v.is_i64())
+                .unwrap_or(false);
+            let (new_raw, new_disp) = render_num(new_num, is_int);
+            let old_disp = render_num(old_num, is_int).1;
+            // DELETE + INSERT: turso 0.1.0's UPDATE silently fails to persist.
+            let _ = conn
+                .execute(
+                    "DELETE FROM stats WHERE character = ?1 AND skey = ?2",
+                    turso::params![vtext(target), vtext(&eff.key)],
+                )
+                .await;
+            let _ = conn
+                .execute(
+                    "INSERT INTO stats (character, category, skey, svalue, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    turso::params![
+                        vtext(target),
+                        vtext(&category),
+                        vtext(&eff.key),
+                        vtext(&new_raw),
+                        vint(now)
+                    ],
+                )
+                .await;
+            let _ = conn
+                .execute(
+                    "INSERT INTO changelog (character, skey, oldv, newv, actor, source, at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    turso::params![
+                        vtext(target),
+                        vtext(&eff.key),
+                        vtext(&old_disp),
+                        vtext(&new_disp),
+                        vtext(actor),
+                        vtext("event"),
+                        vint(now)
+                    ],
+                )
+                .await;
+            notes.push(format!("{target}: {} {:+}", eff.key, new_num - old_num));
+        }
+    }
+    notes
+}
+
 /// Build a character's sheet: identity, usage counters, and its stats from the
 /// `state` module (grouped by category, alphabetical).
 async fn render_sheet(stores: &mut Stores, state_db_dir: &str, user: &str, name: &str, guild: &str) -> String {
@@ -1031,6 +1452,76 @@ async fn render_sheet(stores: &mut Stores, state_db_dir: &str, user: &str, name:
     lines.join("\n")
 }
 
+/// Draw a random event from the guild pool, resolve its targets, apply its
+/// effects to the `state` DB, and return the single plain-bot narration send
+/// (or None if the pool is empty / storage is unavailable). Shared by the
+/// explicit `!rp event` command and the per-channel auto-draw.
+#[allow(clippy::too_many_arguments)]
+async fn draw_event(
+    id: &EngineIdentity,
+    chat: &ChatMessage,
+    stores: &mut Stores,
+    state_db_dir: &str,
+    guild: &str,
+    channel: &str,
+    explicit: Option<&str>,
+    self_char: Option<&str>,
+) -> Option<ContainerForEngine> {
+    let events = match stores.guild(guild).await {
+        Ok(s) => s.list_events().await,
+        Err(_) => return None,
+    };
+    if events.is_empty() {
+        return None;
+    }
+    let ev = &events[random_index(events.len())];
+
+    // Resolve targets per the event's target mode.
+    let mut targets: Vec<String> = Vec::new();
+    match ev.target.as_str() {
+        "self" => {
+            if let Some(c) = self_char {
+                targets.push(c.to_string());
+            } else if let Some((c, _)) = possession_of(stores, guild, &chat.user_uuid7, channel).await {
+                targets.push(c);
+            }
+        }
+        "all" => {
+            if let Ok(s) = stores.guild(guild).await {
+                targets = s.active_characters(channel).await;
+            }
+        }
+        _ => {
+            if let Some(name) = explicit {
+                targets.push(name.to_string());
+            } else if let Ok(s) = stores.guild(guild).await {
+                let active = s.active_characters(channel).await;
+                if !active.is_empty() {
+                    targets.push(active[random_index(active.len())].clone());
+                }
+            }
+        }
+    }
+
+    let mut msg = format!("**{}**", ev.text);
+    if !ev.effects.is_empty() {
+        let applied = if targets.is_empty() {
+            Vec::new()
+        } else {
+            apply_event_effects(state_db_dir, guild, &targets, &ev.effects, &ev.author).await
+        };
+        let sub = if targets.is_empty() {
+            "no active characters to affect".to_string()
+        } else if applied.is_empty() {
+            "no stats were affected".to_string()
+        } else {
+            applied.join(" · ")
+        };
+        msg.push_str(&format!("\n-# {sub}"));
+    }
+    Some(reply_container(id, chat, msg))
+}
+
 async fn handle_command(
     id: &EngineIdentity,
     chat: &ChatMessage,
@@ -1055,7 +1546,7 @@ async fn handle_command(
     match cmd {
         RpCmd::Help => {
             push!(format!(
-                "RP: `{f}rp possess <char>` · `{f}rp start`/`stop` · `{f}rp create <char>` (attach an image for the avatar) · `{f}rp <char> set color=… pronouns=… bio=… tags=… group=… global=true` · `{f}rp <char> sheet` · `{f}rp list` · `{f}rp <char> delete` · `{f}rp detailed on`/`off`",
+                "RP: `{f}rp possess <char>` · `{f}rp start`/`stop` · `{f}rp create <char>` (attach an image for the avatar) · `{f}rp <char> set color=… pronouns=… bio=… tags=… group=… global=true` · `{f}rp <char> sheet` · `{f}rp list` · `{f}rp <char> delete` · `{f}rp detailed on`/`off` · `{f}rp event add <text> [--target self|all|any] [--effect <key>=<±n>]` / `{f}rp event` / `list` / `del <id>` / `chance <0-100>`",
                 f = DEFAULT_FLAG
             ));
         }
@@ -1272,6 +1763,83 @@ async fn handle_command(
                 Err(e) => push!(format!("Storage error: {e}")),
             }
         }
+        RpCmd::EventAdd { text, target, effects } => {
+            let ev = Event {
+                id: uuid::Uuid::now_v7().to_string(),
+                text,
+                target,
+                effects,
+                author: user.clone(),
+                created_at: now_ms(),
+            };
+            match stores.guild(guild).await {
+                Ok(s) => match s.add_event(&ev).await {
+                    Ok(()) => push!(format!("Added event `{}`: {}", short_id(&ev.id), ev.text)),
+                    Err(e) => push!(format!("Could not add event: {e}")),
+                },
+                Err(e) => push!(format!("Storage error: {e}")),
+            }
+        }
+        RpCmd::EventList => {
+            let events = match stores.guild(guild).await {
+                Ok(s) => s.list_events().await,
+                Err(_) => Vec::new(),
+            };
+            if events.is_empty() {
+                push!("No events in the pool yet. `!rp event add <text>` to add one.".to_string());
+            } else {
+                let lines: Vec<String> = events
+                    .iter()
+                    .map(|e| {
+                        let fx = if e.effects.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " [{}]",
+                                e.effects
+                                    .iter()
+                                    .map(|f| format!("{} {:+}", f.key, f.delta))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        };
+                        format!("`{}` {} ({}){}", short_id(&e.id), e.text, e.target, fx)
+                    })
+                    .collect();
+                push!(format!("Events ({}):\n{}", events.len(), lines.join("\n")));
+            }
+        }
+        RpCmd::EventDel(short) => {
+            let events = match stores.guild(guild).await {
+                Ok(s) => s.list_events().await,
+                Err(_) => Vec::new(),
+            };
+            let found = events
+                .iter()
+                .find(|e| e.id == short || e.id.starts_with(&short))
+                .map(|e| e.id.clone());
+            match (found, stores.guild(guild).await) {
+                (Some(full), Ok(s)) => match s.delete_event(&full).await {
+                    Ok(()) => push!(format!("Deleted event `{}`.", short_id(&full))),
+                    Err(e) => push!(format!("Could not delete event: {e}")),
+                },
+                (None, _) => push!(format!("No event with id `{short}`.")),
+                (Some(_), Err(e)) => push!(format!("Storage error: {e}")),
+            }
+        }
+        RpCmd::EventDraw(explicit) => {
+            match draw_event(id, chat, stores, state_db_dir, guild, &channel, explicit.as_deref(), None).await {
+                Some(c) => out.push(c),
+                None => push!("No events in the pool yet. `!rp event add <text>` to add one.".to_string()),
+            }
+        }
+        RpCmd::EventChance(pct) => match stores.guild(guild).await {
+            Ok(s) => match s.set_event_chance(guild, &channel, pct).await {
+                Ok(()) => push!(format!("Auto-event chance set to {pct}% for this channel.")),
+                Err(e) => push!(format!("Could not set event chance: {e}")),
+            },
+            Err(e) => push!(format!("Storage error: {e}")),
+        },
     }
     out
 }
@@ -1466,6 +2034,23 @@ async fn handle_message(
                 format!("Usage: `{command_flag}rp detailed on|off`."),
             )];
         }
+        // `!rp event …` with a malformed argument gets a usage line.
+        if args
+            .split_whitespace()
+            .next()
+            .map(|h| h.eq_ignore_ascii_case("event"))
+            .unwrap_or(false)
+        {
+            return vec![reply_container(
+                id,
+                chat,
+                format!(
+                    "Usage: `{command_flag}rp event add <text> [--target self|all|any] [--effect <key>=<±n>]...` · \
+                     `{command_flag}rp event list` · `{command_flag}rp event del <id>` · \
+                     `{command_flag}rp event [@char]` · `{command_flag}rp event chance <0-100>`."
+                ),
+            )];
+        }
         return Vec::new();
     }
 
@@ -1497,6 +2082,30 @@ async fn handle_message(
         Err(_) => 0,
     };
     let mut out = vec![proxy_container(id, chat, text, key, char_name.clone(), avatar, msg_id)];
+
+    // Maybe draw a random event for this channel (percentage per channel).
+    // `self` resolves to this turn's character so the effect lands before the
+    // detailed status below reads the stats.
+    let chance = match stores.guild(&guild_key).await {
+        Ok(s) => s.event_chance(&guild_key, &channel).await,
+        Err(_) => 0,
+    };
+    if chance > 0 && roll_pct(chance) {
+        if let Some(c) = draw_event(
+            id,
+            chat,
+            stores,
+            state_db_dir,
+            &guild_key,
+            &channel,
+            None,
+            Some(&char_name),
+        )
+        .await
+        {
+            out.push(c);
+        }
+    }
 
     // With detailed status on, append a PLAIN bot message showing what changed.
     let is_detailed = match stores.guild(&guild_key).await {
@@ -1983,5 +2592,329 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    // ── random event pool ("GM events") ─────────────────────────────────────
+
+    /// Create + possess + start a character, exactly as a player would.
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_character(
+        id: &EngineIdentity,
+        stores: &mut Stores,
+        sent: &mut HashSet<String>,
+        state_str: &str,
+        user: &str,
+        channel: &str,
+        guild: &str,
+        name: &str,
+    ) {
+        for (mid, text) in [
+            ("c", format!("!rp create {name}")),
+            ("p", format!("!rp possess {name}")),
+            ("s", "!rp start".to_string()),
+        ] {
+            let m = discord_msg(user, channel, guild, mid, &text);
+            handle_message(id, &m, stores, sent, "!", state_str).await;
+        }
+    }
+
+    /// Create the full `state` module schema (stats + constraints + changelog).
+    async fn seed_state_full(state_dir: &str, guild: &str) {
+        std::fs::create_dir_all(state_dir).unwrap();
+        let path = format!("{}/{guild}.db", state_dir.trim_end_matches('/'));
+        let db = turso::Builder::new_local(path.as_str()).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS stats (\
+             character TEXT NOT NULL, category TEXT NOT NULL, skey TEXT NOT NULL, \
+             svalue TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0, \
+             PRIMARY KEY (character, skey))",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS constraints (\
+             skey TEXT PRIMARY KEY, ctype TEXT, cmin REAL, cmax REAL, \
+             coptions TEXT, updated_at INTEGER NOT NULL DEFAULT 0)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS changelog (\
+             id INTEGER PRIMARY KEY, character TEXT NOT NULL, skey TEXT NOT NULL, \
+             oldv TEXT, newv TEXT, actor TEXT, source TEXT, at INTEGER NOT NULL DEFAULT 0)",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Seed one stat (the value is a raw JSON literal: `10`, `"sword"`, `true`).
+    async fn seed_stat(state_dir: &str, guild: &str, character: &str, category: &str, key: &str, value_json: &str) {
+        let path = format!("{}/{guild}.db", state_dir.trim_end_matches('/'));
+        let db = turso::Builder::new_local(path.as_str()).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "DELETE FROM stats WHERE character = ?1 AND skey = ?2",
+            turso::params![vtext(character), vtext(key)],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stats (character, category, skey, svalue, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            turso::params![vtext(character), vtext(category), vtext(key), vtext(value_json), vint(now_ms())],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Seed a numeric constraint for a stat key.
+    async fn seed_constraint(state_dir: &str, guild: &str, key: &str, min: f64, max: f64) {
+        let path = format!("{}/{guild}.db", state_dir.trim_end_matches('/'));
+        let db = turso::Builder::new_local(path.as_str()).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("DELETE FROM constraints WHERE skey = ?1", turso::params![vtext(key)])
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO constraints (skey, ctype, cmin, cmax, coptions, updated_at) VALUES (?1, 'int', ?2, ?3, NULL, ?4)",
+            turso::params![vtext(key), turso::Value::Real(min), turso::Value::Real(max), vint(now_ms())],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn read_stat_json(state_dir: &str, guild: &str, character: &str, key: &str) -> Option<String> {
+        let path = format!("{}/{guild}.db", state_dir.trim_end_matches('/'));
+        let db = turso::Builder::new_local(path.as_str()).build().await.ok()?;
+        let conn = db.connect().ok()?;
+        let mut rows = conn
+            .query(
+                "SELECT svalue FROM stats WHERE character = ?1 AND skey = ?2",
+                turso::params![vtext(character), vtext(key)],
+            )
+            .await
+            .ok()?;
+        let r = rows.next().await.ok()??;
+        r.get::<String>(0).ok()
+    }
+
+    async fn count_changelog(state_dir: &str, guild: &str) -> i64 {
+        let path = format!("{}/{guild}.db", state_dir.trim_end_matches('/'));
+        let db = turso::Builder::new_local(path.as_str()).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("SELECT COUNT(*) FROM changelog", ()).await.unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    #[test]
+    fn event_add_parses_flags() {
+        assert_eq!(
+            parse_rp_command("event add A trap! --target self --effect gp=-5 --effect hp=-3"),
+            Some(RpCmd::EventAdd {
+                text: "A trap!".into(),
+                target: "self".into(),
+                effects: vec![
+                    Effect { key: "gp".into(), delta: -5.0 },
+                    Effect { key: "hp".into(), delta: -3.0 },
+                ],
+            })
+        );
+        // Default target is `any`; a text-only event has no effects.
+        assert_eq!(
+            parse_rp_command("event add Just flavor"),
+            Some(RpCmd::EventAdd { text: "Just flavor".into(), target: "any".into(), effects: vec![] })
+        );
+        assert_eq!(parse_rp_command("event list"), Some(RpCmd::EventList));
+        assert_eq!(parse_rp_command("event del abc"), Some(RpCmd::EventDel("abc".into())));
+        assert_eq!(parse_rp_command("event"), Some(RpCmd::EventDraw(None)));
+        assert_eq!(parse_rp_command("event @Bob"), Some(RpCmd::EventDraw(Some("Bob".into()))));
+        assert_eq!(parse_rp_command("event Bob"), Some(RpCmd::EventDraw(Some("Bob".into()))));
+        assert_eq!(parse_rp_command("event chance 25"), Some(RpCmd::EventChance(25)));
+        assert_eq!(parse_rp_command("event chance 0"), Some(RpCmd::EventChance(0)));
+        // Malformed input → None (which the caller turns into a usage line).
+        assert_eq!(parse_rp_command("event add"), None);
+        assert_eq!(parse_rp_command("event add  --effect gp=-5"), None);
+        assert_eq!(parse_rp_command("event add hi --effect gp=x"), None);
+        assert_eq!(parse_rp_command("event add hi --target nobody"), None);
+        assert_eq!(parse_rp_command("event chance 200"), None);
+        assert_eq!(parse_rp_command("event chance abc"), None);
+        assert_eq!(parse_rp_command("event del"), None);
+    }
+
+    #[tokio::test]
+    async fn events_add_list_del_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let s = stores.guild("g").await.unwrap();
+        assert!(s.list_events().await.is_empty());
+        let ev = Event {
+            id: "ev1".into(),
+            text: "A trap!".into(),
+            target: "any".into(),
+            effects: vec![Effect { key: "gp".into(), delta: -5.0 }],
+            author: "u1".into(),
+            created_at: 123,
+        };
+        s.add_event(&ev).await.unwrap();
+        let list = s.list_events().await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0], ev);
+        s.delete_event("ev1").await.unwrap();
+        assert!(s.list_events().await.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn drawn_event_applies_effects_and_logs() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let state_dir = std::env::temp_dir().join(format!("cockatiel-rp-state-{}", uuid::Uuid::now_v7()));
+        let state_str = state_dir.to_string_lossy().to_string();
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let mut sent: HashSet<String> = HashSet::new();
+        let id = test_identity();
+        let (user, channel, guild) = ("u1", "chan", "guild1");
+        begin_character(&id, &mut stores, &mut sent, &state_str, user, channel, guild, "Alice").await;
+        seed_state_full(&state_str, guild).await;
+        seed_stat(&state_str, guild, "Alice", "vitals", "gp", "10").await;
+
+        let add = discord_msg(
+            user,
+            channel,
+            guild,
+            "e1",
+            "!rp event add A hidden trap springs! --target self --effect gp=-5",
+        );
+        let out = handle_message(&id, &add, &mut stores, &mut sent, "!", &state_str).await;
+        assert!(sends(&out)[0].msg.contains("Added event"), "{}", sends(&out)[0].msg);
+
+        let draw = discord_msg(user, channel, guild, "e2", "!rp event");
+        let out = handle_message(&id, &draw, &mut stores, &mut sent, "!", &state_str).await;
+        let s = sends(&out);
+        assert_eq!(s.len(), 1);
+        assert!(s[0].proxy.is_none(), "narration is a plain bot send");
+        assert!(s[0].delete_message_id.is_empty());
+        assert_eq!(s[0].platform, "discord");
+        assert_eq!(s[0].channel_id, channel);
+        assert!(s[0].msg.contains("**A hidden trap springs!**"), "{}", s[0].msg);
+        assert!(s[0].msg.contains("-# Alice: gp -5"), "{}", s[0].msg);
+
+        assert_eq!(read_stat_json(&state_str, guild, "Alice", "gp").await.as_deref(), Some("5"));
+        assert_eq!(count_changelog(&state_str, guild).await, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn event_target_all_hits_every_active_character() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let state_dir = std::env::temp_dir().join(format!("cockatiel-rp-state-{}", uuid::Uuid::now_v7()));
+        let state_str = state_dir.to_string_lossy().to_string();
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let mut sent: HashSet<String> = HashSet::new();
+        let id = test_identity();
+        let channel = "chan";
+        let guild = "guild1";
+        begin_character(&id, &mut stores, &mut sent, &state_str, "u1", channel, guild, "Alice").await;
+        begin_character(&id, &mut stores, &mut sent, &state_str, "u2", channel, guild, "Bob").await;
+        seed_state_full(&state_str, guild).await;
+        seed_stat(&state_str, guild, "Alice", "vitals", "gp", "10").await;
+        seed_stat(&state_str, guild, "Bob", "vitals", "gp", "8").await;
+
+        let add = discord_msg("u1", channel, guild, "e1", "!rp event add The floor gives way --target all --effect gp=-5");
+        handle_message(&id, &add, &mut stores, &mut sent, "!", &state_str).await;
+        let draw = discord_msg("u1", channel, guild, "e2", "!rp event");
+        let out = handle_message(&id, &draw, &mut stores, &mut sent, "!", &state_str).await;
+        let msg = &sends(&out)[0].msg;
+        assert!(msg.contains("Alice: gp -5"), "{msg}");
+        assert!(msg.contains("Bob: gp -5"), "{msg}");
+
+        assert_eq!(read_stat_json(&state_str, guild, "Alice", "gp").await.as_deref(), Some("5"));
+        assert_eq!(read_stat_json(&state_str, guild, "Bob", "gp").await.as_deref(), Some("3"));
+        assert_eq!(count_changelog(&state_str, guild).await, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn text_only_event_posts_narration_and_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let state_dir = std::env::temp_dir().join(format!("cockatiel-rp-state-{}", uuid::Uuid::now_v7()));
+        let state_str = state_dir.to_string_lossy().to_string();
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let mut sent: HashSet<String> = HashSet::new();
+        let id = test_identity();
+        let (user, channel, guild) = ("u1", "chan", "guild1");
+        begin_character(&id, &mut stores, &mut sent, &state_str, user, channel, guild, "Alice").await;
+        seed_state_full(&state_str, guild).await;
+        seed_stat(&state_str, guild, "Alice", "vitals", "gp", "10").await;
+
+        let add = discord_msg(user, channel, guild, "e1", "!rp event add A chill wind passes through.");
+        handle_message(&id, &add, &mut stores, &mut sent, "!", &state_str).await;
+        let draw = discord_msg(user, channel, guild, "e2", "!rp event");
+        let out = handle_message(&id, &draw, &mut stores, &mut sent, "!", &state_str).await;
+        let s = sends(&out);
+        assert_eq!(s.len(), 1);
+        assert!(s[0].msg.contains("**A chill wind passes through.**"), "{}", s[0].msg);
+        assert!(!s[0].msg.contains("-#"), "a text-only event has no effect subtext");
+
+        assert_eq!(read_stat_json(&state_str, guild, "Alice", "gp").await.as_deref(), Some("10"));
+        assert_eq!(count_changelog(&state_str, guild).await, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn event_effect_clamps_to_constraints() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let state_dir = std::env::temp_dir().join(format!("cockatiel-rp-state-{}", uuid::Uuid::now_v7()));
+        let state_str = state_dir.to_string_lossy().to_string();
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let mut sent: HashSet<String> = HashSet::new();
+        let id = test_identity();
+        let (user, channel, guild) = ("u1", "chan", "guild1");
+        begin_character(&id, &mut stores, &mut sent, &state_str, user, channel, guild, "Alice").await;
+        seed_state_full(&state_str, guild).await;
+        seed_stat(&state_str, guild, "Alice", "vitals", "gp", "10").await;
+        seed_constraint(&state_str, guild, "gp", 0.0, 6.0).await;
+
+        let add = discord_msg(user, channel, guild, "e1", "!rp event add You are drained --target self --effect gp=-100");
+        handle_message(&id, &add, &mut stores, &mut sent, "!", &state_str).await;
+        let draw = discord_msg(user, channel, guild, "e2", "!rp event");
+        let out = handle_message(&id, &draw, &mut stores, &mut sent, "!", &state_str).await;
+        // The applied delta is the CLAMPED one (10 → 0).
+        assert!(sends(&out)[0].msg.contains("Alice: gp -10"), "{}", sends(&out)[0].msg);
+        assert_eq!(read_stat_json(&state_str, guild, "Alice", "gp").await.as_deref(), Some("0"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn event_chance_persists_per_channel() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let path = dir.to_string_lossy().to_string();
+        {
+            let mut stores = Stores::new(path.clone());
+            let s = stores.guild("g").await.unwrap();
+            assert_eq!(s.event_chance("g", "c").await, 0, "default is off");
+            s.set_event_chance("g", "c", 25).await.unwrap();
+            assert_eq!(s.event_chance("g", "c").await, 25);
+            // Toggling detailed must not clobber the chance.
+            s.set_detailed("g", "c", true).await.unwrap();
+            assert!(s.detailed("g", "c").await);
+            assert_eq!(s.event_chance("g", "c").await, 25);
+            // A different channel keeps its own (zero) value.
+            assert_eq!(s.event_chance("g", "other").await, 0);
+        }
+        // A fresh Stores over the same dir still sees the chance.
+        let mut stores = Stores::new(path);
+        assert_eq!(stores.guild("g").await.unwrap().event_chance("g", "c").await, 25);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
