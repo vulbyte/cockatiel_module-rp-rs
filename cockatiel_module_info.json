@@ -42,6 +42,12 @@
       "sensitive": false
     },
     {
+      "key": "bans_path",
+      "label": "Bans file (bans.json)",
+      "list": false,
+      "sensitive": false
+    },
+    {
       "key": "reconnect_base_secs",
       "label": "Reconnect base (s)",
       "list": false,

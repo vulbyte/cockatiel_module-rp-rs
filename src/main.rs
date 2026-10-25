@@ -42,8 +42,15 @@ type WsWriteHalf = futures_util::stream::SplitSink<
 const RP_COMMAND: &str = "rp";
 const DEFAULT_FLAG: &str = "!";
 const DEFAULT_DB_DIR: &str = "~/.cockatiel/rp";
+const DEFAULT_BANS_PATH: &str = "~/.cockatiel/rp/bans.json";
 const DEFAULT_RECONNECT_BASE_SECS: u32 = 1;
 const DEFAULT_RECONNECT_MAX_SECS: u32 = 30;
+/// The engine→module query that asks this module for the bans it holds, and the
+/// module→engine report that answers it. These strings are the whole exchange
+/// (over the existing `DatabaseQueryResult` / `DatabaseQuery` payloads), so no
+/// proto change is needed.
+const MODULE_BANS_QUERY: &str = "module_bans_query";
+const MODULE_BANS_REPORT: &str = "module_bans_report";
 /// The DB key used when a message has no guild (e.g. a DM).
 const DM_DB: &str = "_dm";
 
@@ -53,6 +60,10 @@ const DM_DB: &str = "_dm";
 struct Settings {
     command_flag: String,
     db_dir: String,
+    /// The authoritative per-module ban record. Entries are keyed per guild:
+    /// `{ "<guild_id>": { "<user>": {user,key,by,reason,at} } }`. The engine
+    /// asks for its contents periodically so hand edits are picked up.
+    bans_path: String,
     /// Where the `state` module keeps its per-server DBs — the character sheet
     /// reads a character's stats from there (best-effort).
     state_db_dir: String,
@@ -84,6 +95,11 @@ fn ensure_defaults() -> Settings {
         .and_then(|v| v.as_str())
         .unwrap_or(DEFAULT_DB_DIR)
         .to_string();
+    let bans_path = ms
+        .get("bans_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or(DEFAULT_BANS_PATH)
+        .to_string();
     let state_db_dir = ms
         .get("state_db_dir")
         .and_then(|v| v.as_str())
@@ -110,6 +126,8 @@ fn ensure_defaults() -> Settings {
                     .or_insert_with(|| serde_json::json!(command_flag));
                 ms.entry("db_dir".to_string())
                     .or_insert_with(|| serde_json::json!(db_dir));
+                ms.entry("bans_path".to_string())
+                    .or_insert_with(|| serde_json::json!(bans_path));
                 ms.entry("state_db_dir".to_string())
                     .or_insert_with(|| serde_json::json!(state_db_dir));
                 ms.entry("reconnect_base_secs".to_string())
@@ -123,6 +141,7 @@ fn ensure_defaults() -> Settings {
     Settings {
         command_flag,
         db_dir,
+        bans_path,
         state_db_dir,
         reconnect_base_secs,
         reconnect_max_secs,
@@ -190,6 +209,8 @@ enum RpCmd {
     EventDel(String),
     EventDraw(Option<String>),
     EventChance(u32),
+    Ban { user: String, reason: String },
+    Unban(String),
 }
 
 /// Parse the args (already stripped of `!rp`) into a subcommand.
@@ -210,6 +231,11 @@ fn parse_rp_command(args: &str) -> Option<RpCmd> {
         "create" => (!rest.is_empty()).then(|| RpCmd::Create(rest.to_string())),
         "delete" => (!rest.is_empty()).then(|| RpCmd::Delete(rest.to_string())),
         "sheet" | "info" | "show" => (!rest.is_empty()).then(|| RpCmd::Sheet(rest.to_string())),
+        "ban" => parse_ban_args(rest),
+        "unban" => {
+            let target = rest.split_whitespace().next().unwrap_or("");
+            (!target.is_empty()).then(|| RpCmd::Unban(target.to_string()))
+        }
         "event" => parse_event_command(rest),
         // Otherwise the head is a character NAME followed by a verb.
         _ => {
@@ -237,6 +263,23 @@ fn parse_rp_command(args: &str) -> Option<RpCmd> {
             }
         }
     }
+}
+
+/// Parse `ban <user> [reason]`: the first token is the target, the rest is the
+/// free-text reason.
+fn parse_ban_args(rest: &str) -> Option<RpCmd> {
+    let rest = rest.trim();
+    let (user, reason) = match rest.split_once(char::is_whitespace) {
+        Some((u, r)) => (u, r.trim()),
+        None => (rest, ""),
+    };
+    if user.is_empty() {
+        return None;
+    }
+    Some(RpCmd::Ban {
+        user: user.to_string(),
+        reason: reason.to_string(),
+    })
 }
 
 /// Parse the args after `!rp event`. `add` takes free text up to the first
@@ -360,6 +403,107 @@ fn discord_meta(raw_data: &[u8]) -> (String, String, String) {
         .unwrap_or("")
         .to_string();
     (s("id"), s("guild_id"), attach)
+}
+
+// ── bans.json ───────────────────────────────────────────────────────────────
+
+/// One ban record, as stored in `bans.json` and reported to the engine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct BanEntry {
+    /// The banned identity (normalized `!rp ban` target, e.g. a handle or id).
+    user: String,
+    /// The key the entry is stored under (kept with the record for clarity).
+    key: String,
+    /// Who issued the ban (the actor's user-db uuid7/handle from `user_data`).
+    by: String,
+    reason: String,
+    /// Epoch-milliseconds when the ban was recorded.
+    at: i64,
+}
+
+/// The whole `bans.json`: guild id -> (ban key -> entry).
+type BanMap = HashMap<String, HashMap<String, BanEntry>>;
+
+/// Read the authoritative ban file. A missing/corrupt file is an empty record
+/// (the file is created on the first ban), never an error on the hot path.
+fn load_bans(path: &str) -> BanMap {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|d| serde_json::from_str::<BanMap>(&d).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the ban file atomically-ish (write then rename over the target), so
+/// an interrupted write cannot leave a truncated `bans.json`.
+fn save_bans(path: &str, map: &BanMap) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// Normalize a `!rp ban <target>` argument. Discord mentions (`<@123>`,
+/// `<@!123>`, `<@&123>`) become the bare id; a leading `@` is dropped.
+fn normalize_ban_user(tok: &str) -> String {
+    let t = tok.trim();
+    if let Some(inner) = t.strip_prefix("<@") {
+        let inner = inner.trim_end_matches('>');
+        let inner = inner.trim_start_matches(['!', '&']);
+        return inner.trim().to_string();
+    }
+    t.trim_start_matches('@').trim().to_string()
+}
+
+/// Every distinct banned identity across all guilds (the engine only needs a
+/// flat set; guild scoping stays a module concern).
+fn all_ban_ids(map: &BanMap) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for guild in map.values() {
+        for entry in guild.values() {
+            let id = entry.user.trim();
+            if !id.is_empty() && seen.insert(id.to_string()) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Whether any of `candidates` is banned in `guild`. A missing guild / empty
+/// candidate is never a match.
+fn is_banned_in_guild(map: &BanMap, guild: &str, candidates: &[&str]) -> bool {
+    let Some(banned) = map.get(guild) else {
+        return false;
+    };
+    candidates.iter().any(|c| {
+        let c = c.trim();
+        !c.is_empty() && banned.values().any(|b| b.user == c)
+    })
+}
+
+/// The author's Discord id and username from the adapter's `raw_data` (best
+/// effort — an absent `author` yields empty strings). The adapter's
+/// `user_uuid7` is the username, but the id is a useful extra match key.
+fn discord_author(raw_data: &[u8]) -> (String, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw_data) else {
+        return (String::new(), String::new());
+    };
+    let author = v.get("author");
+    let id = author
+        .and_then(|a| a.get("id"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let username = author
+        .and_then(|a| a.get("username"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    (id, username)
 }
 
 // ── store (turso) ───────────────────────────────────────────────────────────
@@ -990,17 +1134,53 @@ fn now_ms() -> i64 {
 /// them, so no locking is needed — the module runs one loop).
 struct Stores {
     dir: String,
+    /// Absolute path to this module's `bans.json`.
+    bans_path: String,
+    /// Cached ban record + the file mtime it was read at, so the per-message
+    /// enforcement check does not re-read the file on every chat line. A hand
+    /// edit (mtime change) is still picked up on the next message.
+    bans_cache: Option<BanMap>,
+    bans_mtime: Option<std::time::SystemTime>,
     by_guild: HashMap<String, Store>,
     global: Option<Store>,
 }
 
 impl Stores {
+    #[cfg(test)]
     fn new(dir: String) -> Self {
+        // Default the ban file to the data dir, matching the config default.
+        let bans_path = Self::default_bans_path(&dir);
+        Self::new_with_bans(dir, bans_path)
+    }
+
+    fn new_with_bans(dir: String, bans_path: String) -> Self {
         Self {
             dir,
+            bans_path: expand_tilde(&bans_path),
+            bans_cache: None,
+            bans_mtime: None,
             by_guild: HashMap::new(),
             global: None,
         }
+    }
+
+    #[cfg(test)]
+    fn default_bans_path(dir: &str) -> String {
+        format!("{}/bans.json", expand_tilde(dir).trim_end_matches('/'))
+    }
+
+    /// The current ban record, reloaded when the file's mtime changes (or on
+    /// the first call). This is how a ban added/removed by hand in `bans.json`
+    /// is honoured without a restart.
+    fn bans(&mut self) -> &BanMap {
+        let mtime = std::fs::metadata(&self.bans_path)
+            .and_then(|m| m.modified())
+            .ok();
+        if self.bans_cache.is_none() || mtime != self.bans_mtime {
+            self.bans_cache = Some(load_bans(&self.bans_path));
+            self.bans_mtime = mtime;
+        }
+        self.bans_cache.as_ref().unwrap()
     }
 
     fn path_for(key: &str, dir: &str) -> String {
@@ -1117,6 +1297,44 @@ fn reply_container(id: &EngineIdentity, chat: &ChatMessage, msg: String) -> Cont
         module_instance_uuid7: id.instance.clone(),
         payload: Some(EnginePayload::SendToPlatforms(base_send(id, chat, msg))),
     }
+}
+
+/// Build the module→engine ban report from an already-loaded ban map. The
+/// engine merges the flat identifier list into its module-ban cache.
+fn bans_report_container(
+    id: &EngineIdentity,
+    map: &BanMap,
+) -> ContainerForEngine {
+    let json = serde_json::json!({ "bans": all_ban_ids(map) }).to_string();
+    ContainerForEngine {
+        version: 2,
+        auth_token: id.auth.clone(),
+        module_name: id.module.clone(),
+        module_instance_uuid7: id.instance.clone(),
+        payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
+            query_id: MODULE_BANS_REPORT.to_string(),
+            sql: json,
+            params: Vec::new(),
+        })),
+    }
+}
+
+/// The actor and mod-gate for a ban command. The actor is the sender's
+/// `user_data` identity (canonical uuid7 when present, else username); the
+/// command is gated to moderators/admins/owners.
+fn ban_actor(chat: &ChatMessage) -> (bool, String) {
+    let Some(ud) = chat.user_data.as_ref() else {
+        return (false, chat.user_uuid7.clone());
+    };
+    let allowed = ud.is_moderator || ud.is_admin || ud.is_owner;
+    let actor = if !ud.uuid.is_empty() {
+        ud.uuid.clone()
+    } else if !ud.username.is_empty() {
+        ud.username.clone()
+    } else {
+        chat.user_uuid7.clone()
+    };
+    (allowed, actor)
 }
 
 /// A PROXIED send (post `msg` as the character, then delete the trigger) as an
@@ -1840,6 +2058,76 @@ async fn handle_command(
             },
             Err(e) => push!(format!("Storage error: {e}")),
         },
+        RpCmd::Ban { user, reason } => {
+            let (allowed, actor) = ban_actor(chat);
+            if !allowed {
+                push!("Only moderators can manage RP bans.".to_string());
+                return out;
+            }
+            let target = normalize_ban_user(&user);
+            if target.is_empty() {
+                push!("Usage: `!rp ban <user> [reason]`.".to_string());
+                return out;
+            }
+            let mut map = load_bans(&stores.bans_path);
+            let entry = BanEntry {
+                user: target.clone(),
+                key: target.clone(),
+                by: actor,
+                reason: reason.clone(),
+                at: now_ms(),
+            };
+            map.entry(guild.to_string())
+                .or_default()
+                .insert(target.clone(), entry);
+            match save_bans(&stores.bans_path, &map) {
+                Ok(()) => {
+                    // Invalidate the enforcement cache so the new file is read
+                    // on the next message even if the mtime resolution hides it.
+                    stores.bans_cache = None;
+                    stores.bans_mtime = None;
+                    push!(if reason.is_empty() {
+                        format!("Banned `{target}` from RP.")
+                    } else {
+                        format!("Banned `{target}` from RP: {reason}")
+                    });
+                    // Keep the engine's aggregate in step immediately.
+                    out.push(bans_report_container(id, &map));
+                }
+                Err(e) => push!(format!("Could not save the ban: {e}")),
+            }
+        }
+        RpCmd::Unban(user) => {
+            let (allowed, _actor) = ban_actor(chat);
+            if !allowed {
+                push!("Only moderators can manage RP bans.".to_string());
+                return out;
+            }
+            let target = normalize_ban_user(&user);
+            let mut map = load_bans(&stores.bans_path);
+            let removed = map
+                .get_mut(guild)
+                .and_then(|g| g.remove(&target))
+                .is_some();
+            if removed && map.get(guild).map(|g| g.is_empty()).unwrap_or(false) {
+                map.remove(guild);
+            }
+            match save_bans(&stores.bans_path, &map) {
+                Ok(()) => {
+                    stores.bans_cache = None;
+                    stores.bans_mtime = None;
+                    push!(if removed {
+                        format!("Unbanned `{target}` from RP.")
+                    } else {
+                        format!("`{target}` was not banned.")
+                    });
+                    if removed {
+                        out.push(bans_report_container(id, &map));
+                    }
+                }
+                Err(e) => push!(format!("Could not save the ban list: {e}")),
+            }
+        }
     }
     out
 }
@@ -1890,10 +2178,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(async move {
         let mut read = read;
-        let mut stores = Stores::new(settings.db_dir.clone());
+        let mut stores = Stores::new_with_bans(settings.db_dir.clone(), settings.bans_path.clone());
         let mut sent_avatars: HashSet<String> = HashSet::new();
         loop {
             register_catch_all(&write_for_task, &identity_for_task).await;
+            // Announce our current bans as soon as we (re)connect, so the engine
+            // never has to wait for the first refresh tick to learn them.
+            {
+                let id = identity_for_task.lock().await.clone();
+                let report = {
+                    let map = stores.bans();
+                    bans_report_container(&id, map)
+                };
+                send_container(&write_for_task, report).await;
+            }
             loop {
                 let Some(msg) = read.next().await else { break };
                 let data = match msg {
@@ -1960,6 +2258,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         send_container(&write_for_task, ack).await;
                     }
+                    Some(ModulePayload::DatabaseQueryResult(res))
+                        if res.query_id == MODULE_BANS_QUERY =>
+                    {
+                        // The engine asked for our current bans. Answer with a
+                        // `module_bans_report` (fresh read, so hand edits count).
+                        let report = {
+                            let map = stores.bans();
+                            bans_report_container(&id, map)
+                        };
+                        send_container(&write_for_task, report).await;
+                    }
                     Some(ModulePayload::Shutdown(_)) => {
                         info!("Engine requested shutdown — exiting");
                         std::process::exit(0);
@@ -2015,6 +2324,23 @@ async fn handle_message(
     let guild_key = if guild.is_empty() { DM_DB.to_string() } else { guild };
     let user = chat.user_uuid7.clone();
     let channel = chat.channel_id.clone();
+
+    // Local enforcement: this module ignores messages from anyone it has banned
+    // in this guild, even when the engine is not the one asking (the module must
+    // be correct on its own). The engine also drops such messages at entry, so
+    // this is the standalone fallback, not the primary gate.
+    let (author_id, author_name) = discord_author(&chat.raw_data);
+    let locally_banned = {
+        let bans = stores.bans();
+        is_banned_in_guild(
+            bans,
+            &guild_key,
+            &[user.as_str(), author_id.as_str(), author_name.as_str()],
+        )
+    };
+    if locally_banned {
+        return Vec::new();
+    }
 
     // A `!rp` command (parsed here — the module is a catch-all, not a command owner).
     if let Some(args) = parse_rp_args(&chat.raw_message, command_flag, RP_COMMAND) {
@@ -2915,6 +3241,186 @@ mod tests {
         // A fresh Stores over the same dir still sees the chance.
         let mut stores = Stores::new(path);
         assert_eq!(stores.guild("g").await.unwrap().event_chance("g", "c").await, 25);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── per-module bans ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parses_ban_and_unban_and_normalizes_targets() {
+        assert_eq!(
+            parse_rp_command("ban @bob spam"),
+            Some(RpCmd::Ban {
+                user: "@bob".into(),
+                reason: "spam".into()
+            })
+        );
+        assert_eq!(
+            parse_rp_command("ban <@123>"),
+            Some(RpCmd::Ban {
+                user: "<@123>".into(),
+                reason: String::new()
+            })
+        );
+        assert_eq!(parse_rp_command("unban bob"), Some(RpCmd::Unban("bob".into())));
+        assert_eq!(parse_rp_command("ban"), None);
+        assert_eq!(parse_rp_command("unban"), None);
+
+        assert_eq!(normalize_ban_user("@bob"), "bob");
+        assert_eq!(normalize_ban_user("<@!123>"), "123");
+        assert_eq!(normalize_ban_user("<@&456>"), "456");
+        assert_eq!(normalize_ban_user("  plain  "), "plain");
+    }
+
+    fn mod_chat(user: &str, channel: &str, guild: &str, id: &str, text: &str) -> ChatMessage {
+        let mut c = discord_msg(user, channel, guild, id, text);
+        c.user_data = Some(UserData {
+            uuid: "mod-uuid".into(),
+            username: user.into(),
+            is_moderator: true,
+            ..Default::default()
+        });
+        c
+    }
+
+    #[tokio::test]
+    async fn ban_and_unban_persist_report_and_enforce_locally() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let mut sent: HashSet<String> = HashSet::new();
+        let id = test_identity();
+        let (user, channel, guild) = ("mod1", "chan", "guild1");
+
+        // A mod bans a user by handle.
+        let out = handle_message(
+            &id,
+            &mod_chat(user, channel, guild, "m1", "!rp ban @badguy spam"),
+            &mut stores,
+            &mut sent,
+            "!",
+            "",
+        )
+        .await;
+        assert!(sends(&out)[0].msg.contains("Banned `badguy`"));
+        // A report to the engine rides along.
+        let reports: Vec<DatabaseQuery> = out
+            .iter()
+            .filter_map(|c| match &c.payload {
+                Some(EnginePayload::DatabaseQuery(q)) if q.query_id == MODULE_BANS_REPORT => {
+                    Some(q.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&reports[0].sql).unwrap();
+        assert_eq!(v["bans"], serde_json::json!(["badguy"]));
+
+        // Persisted with the actor and reason.
+        let map = load_bans(&stores.bans_path);
+        let entry = &map[guild]["badguy"];
+        assert_eq!(entry.by, "mod-uuid");
+        assert_eq!(entry.reason, "spam");
+        assert_eq!(entry.user, "badguy");
+
+        // The module ignores the banned user locally (even without the engine).
+        let out = handle_message(
+            &id,
+            &discord_msg("badguy", channel, guild, "m2", "!rp list"),
+            &mut stores,
+            &mut sent,
+            "!",
+            "",
+        )
+        .await;
+        assert!(out.is_empty(), "a banned user's message must be ignored");
+
+        // A non-mod cannot ban.
+        let mut norm = discord_msg("someone", channel, guild, "m3", "!rp ban @other");
+        norm.user_data = Some(UserData {
+            uuid: "u-someone".into(),
+            username: "someone".into(),
+            ..Default::default()
+        });
+        let out = handle_message(&id, &norm, &mut stores, &mut sent, "!", "").await;
+        assert!(sends(&out)[0].msg.contains("Only moderators"));
+
+        // Unban clears the record and the local gate.
+        let out = handle_message(
+            &id,
+            &mod_chat(user, channel, guild, "m4", "!rp unban badguy"),
+            &mut stores,
+            &mut sent,
+            "!",
+            "",
+        )
+        .await;
+        assert!(sends(&out)[0].msg.contains("Unbanned `badguy`"));
+        assert!(!load_bans(&stores.bans_path).contains_key(guild));
+
+        // The formerly banned user can interact again.
+        let out = handle_message(
+            &id,
+            &discord_msg("badguy", channel, guild, "m5", "!rp list"),
+            &mut stores,
+            &mut sent,
+            "!",
+            "",
+        )
+        .await;
+        assert_eq!(
+            sends(&out).len(),
+            1,
+            "an unbanned user's command must be handled"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bans_are_keyed_per_guild() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-rp-{}", uuid::Uuid::now_v7()));
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let mut sent: HashSet<String> = HashSet::new();
+        let id = test_identity();
+
+        handle_message(
+            &id,
+            &mod_chat("mod1", "c1", "guildA", "a1", "!rp ban badguy"),
+            &mut stores,
+            &mut sent,
+            "!",
+            "",
+        )
+        .await;
+        // Banned in guildA...
+        assert!(handle_message(
+            &id,
+            &discord_msg("badguy", "c1", "guildA", "a2", "!rp list"),
+            &mut stores,
+            &mut sent,
+            "!",
+            "",
+        )
+        .await
+        .is_empty());
+        // ...but not in guildB.
+        assert_eq!(
+            sends(
+                &handle_message(
+                    &id,
+                    &discord_msg("badguy", "c2", "guildB", "b1", "!rp list"),
+                    &mut stores,
+                    &mut sent,
+                    "!",
+                    "",
+                )
+                .await
+            )
+            .len(),
+            1
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
